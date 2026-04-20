@@ -85,12 +85,35 @@ def ensure_deps():
 
 # -- Step 2 - Icona ------------------------------------------------------------
 def create_icon():
-    step("Verifica icona")
+    step("Preparazione icona")
     if not ICON_FILE.exists():
         log(f"[X] Icona non trovata: {ICON_FILE.name}")
         log("    Metti logo_browser.ico nella cartella del progetto e riprova.")
         sys.exit(1)
-    log(f"[OK] Icona: {ICON_FILE.name}")
+
+    from PIL import Image
+
+    src = Image.open(str(ICON_FILE)).convert("RGBA")
+    bbox = src.getbbox()
+    content = src.crop(bbox)
+
+    def make_size(img, size):
+        margin = max(1, int(size * 0.06))
+        inner  = size - margin * 2
+        thumb  = img.resize((inner, inner), Image.LANCZOS)
+        canvas = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+        canvas.paste(thumb, (margin, margin), thumb)
+        return canvas
+
+    sizes  = [16, 24, 32, 48, 64, 128, 256]
+    frames = [make_size(content, s) for s in sizes]
+    frames[-1].save(
+        str(ICON_FILE),
+        format="ICO",
+        sizes=[(s, s) for s in sizes],
+        append_images=frames[:-1],
+    )
+    log(f"[OK] Icona rigenerata: {ICON_FILE.name}  ({len(sizes)} risoluzioni)")
 
 
 # -- Step 3 - PyInstaller ------------------------------------------------------
