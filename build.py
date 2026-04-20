@@ -316,6 +316,8 @@ def make_installer():
     step("Creazione installer Windows")
     RELEASE_DIR.mkdir(exist_ok=True)
 
+    src = _find_built_app()
+
     iss_path = ROOT / "installer.iss"
     iss_path.write_text(textwrap.dedent(f"""\
         ; CalNav Browser - Inno Setup script
@@ -339,7 +341,7 @@ def make_installer():
         ; Registrazione Pannello di Controllo -> Programmi e funzionalita'
         UninstallDisplayName={APP_NAME} Browser
         UninstallDisplayIcon={{app}}\\{APP_NAME}.exe
-        AppId={{8F3A2C1D-4B7E-4F9A-B2D6-1E5C3A8F7D2B}}
+        AppId={{{{8F3A2C1D-4B7E-4F9A-B2D6-1E5C3A8F7D2B}}
 
         ; Output
         OutputDir=release
@@ -357,12 +359,12 @@ def make_installer():
 
         [Tasks]
         Name: "desktopicon"; Description: "Crea icona sul Desktop"; \\
-            GroupDescription: "Icone aggiuntive:"; Flags: checked
+            GroupDescription: "Icone aggiuntive:"
         Name: "startmenu";   Description: "Aggiungi al Menu Start"; \\
-            GroupDescription: "Icone aggiuntive:"; Flags: checked
+            GroupDescription: "Icone aggiuntive:"
 
         [Files]
-        Source: "dist\\{APP_NAME}\\*"; DestDir: "{{app}}"; \\
+        Source: "{src}\\*"; DestDir: "{{app}}"; \\
             Flags: ignoreversion recursesubdirs createallsubdirs
 
         [Icons]
