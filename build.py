@@ -306,7 +306,7 @@ def make_installer():
         DefaultGroupName={APP_NAME}
         OutputDir=release
         OutputBaseFilename={APP_NAME}-{APP_VERSION}-Setup
-        SetupIconFile=calnav_icon.ico
+        SetupIconFile=logo_browser.ico
         UninstallDisplayIcon={{app}}\\{APP_NAME}.exe
         Compression=lzma2/ultra64
         SolidCompression=yes

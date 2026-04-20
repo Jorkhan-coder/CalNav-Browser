@@ -1455,7 +1455,7 @@ class CalNavWindow(QMainWindow):
 # ── Entry point ───────────────────────────────────────────────────────────────
 def _app_icon() -> QIcon:
     base = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
-    for name in ("logo_browser.ico", "calnav_icon.ico"):
+    for name in ("logo_browser.ico",):
         ico = base / name
         if ico.exists():
             return QIcon(str(ico))
