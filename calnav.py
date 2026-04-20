@@ -949,9 +949,13 @@ class SettingsDialog(QDialog):
             lbl_k.setStyleSheet(f"color: {TEXT_DIM}; font-size: 12px;")
             row.addWidget(lbl_k)
 
-            lbl_v = QLabel(value)
-            lbl_v.setStyleSheet(f"color: {TEXT_BRIGHT}; font-size: 12px;")
-            lbl_v.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            if value.startswith("https://"):
+                lbl_v = QLabel(f'<a href="{value}" style="color:{TEAL};">{value}</a>')
+                lbl_v.setOpenExternalLinks(True)
+            else:
+                lbl_v = QLabel(value)
+                lbl_v.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            lbl_v.setStyleSheet("font-size: 12px;")
             row.addWidget(lbl_v, stretch=1)
             vbox.addLayout(row)
             vbox.addSpacing(4)
