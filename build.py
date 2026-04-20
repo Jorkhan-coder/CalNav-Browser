@@ -324,18 +324,32 @@ def make_installer():
         [Setup]
         AppName={APP_NAME}
         AppVersion={APP_VERSION}
+        AppVerName={APP_NAME} {APP_VERSION}
         AppPublisher=CalNav Browser
+        AppPublisherURL=https://github.com/Jorkhan-coder/CalNav-Browser
+        AppSupportURL=https://github.com/Jorkhan-coder/CalNav-Browser/issues
+        AppUpdatesURL=https://github.com/Jorkhan-coder/CalNav-Browser/releases
+
+        ; Installazione in Programmi con privilegi amministratore
         DefaultDirName={{autopf}}\\{APP_NAME}
         DefaultGroupName={APP_NAME}
+        PrivilegesRequired=admin
+        ArchitecturesInstallIn64BitMode=x64compatible
+
+        ; Registrazione Pannello di Controllo -> Programmi e funzionalita'
+        UninstallDisplayName={APP_NAME} Browser
+        UninstallDisplayIcon={{app}}\\{APP_NAME}.exe
+        AppId={{8F3A2C1D-4B7E-4F9A-B2D6-1E5C3A8F7D2B}}
+
+        ; Output
         OutputDir=release
         OutputBaseFilename={APP_NAME}-{APP_VERSION}-Setup
         SetupIconFile=logo_browser.ico
-        UninstallDisplayIcon={{app}}\\{APP_NAME}.exe
+
+        ; Compressione massima
         Compression=lzma2/ultra64
         SolidCompression=yes
         WizardStyle=modern
-        PrivilegesRequired=lowest
-        ArchitecturesInstallIn64BitMode=x64compatible
 
         [Languages]
         Name: "italian"; MessagesFile: "compiler:Languages\\Italian.isl"
@@ -343,22 +357,32 @@ def make_installer():
 
         [Tasks]
         Name: "desktopicon"; Description: "Crea icona sul Desktop"; \\
-            GroupDescription: "Icone aggiuntive:"
+            GroupDescription: "Icone aggiuntive:"; Flags: checked
+        Name: "startmenu";   Description: "Aggiungi al Menu Start"; \\
+            GroupDescription: "Icone aggiuntive:"; Flags: checked
 
         [Files]
         Source: "dist\\{APP_NAME}\\*"; DestDir: "{{app}}"; \\
             Flags: ignoreversion recursesubdirs createallsubdirs
 
         [Icons]
-        Name: "{{group}}\\{APP_NAME}";           Filename: "{{app}}\\{APP_NAME}.exe"
-        Name: "{{group}}\\Disinstalla {APP_NAME}"; Filename: "{{uninstallexe}}"
-        Name: "{{commondesktop}}\\{APP_NAME}";   Filename: "{{app}}\\{APP_NAME}.exe"; \\
+        Name: "{{group}}\\{APP_NAME}"; \\
+            Filename: "{{app}}\\{APP_NAME}.exe"; \\
+            Tasks: startmenu
+        Name: "{{group}}\\Disinstalla {APP_NAME}"; \\
+            Filename: "{{uninstallexe}}"; \\
+            Tasks: startmenu
+        Name: "{{commondesktop}}\\{APP_NAME}"; \\
+            Filename: "{{app}}\\{APP_NAME}.exe"; \\
             Tasks: desktopicon
 
         [Run]
         Filename: "{{app}}\\{APP_NAME}.exe"; \\
             Description: "Avvia {APP_NAME} adesso"; \\
             Flags: nowait postinstall skipifsilent
+
+        [UninstallDelete]
+        Type: filesandordirs; Name: "{{app}}"
     """), encoding="utf-8")
     log("[OK] Script Inno Setup: installer.iss")
 
