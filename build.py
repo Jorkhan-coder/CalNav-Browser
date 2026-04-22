@@ -21,7 +21,7 @@ if hasattr(sys.stdout, "reconfigure"):
 # -- Configurazione ------------------------------------------------------------
 ROOT        = Path(__file__).parent.resolve()
 APP_NAME    = "CalNav"
-APP_VERSION = "1.0.0-alpha"
+APP_VERSION = "1.1.0-alpha"
 ICON_FILE   = ROOT / "logo_browser.ico"
 DIST_DIR    = ROOT / "dist"
 BUILD_DIR   = ROOT / "build"
@@ -86,14 +86,24 @@ def ensure_deps():
 # -- Step 2 - Icona ------------------------------------------------------------
 def create_icon():
     step("Preparazione icona")
-    if not ICON_FILE.exists():
-        log(f"[X] Icona non trovata: {ICON_FILE.name}")
-        log("    Metti logo_browser.ico nella cartella del progetto e riprova.")
-        sys.exit(1)
+
+    # ── Sorgente dell'icona ────────────────────────────────────────────────────
+    # Usiamo sempre logo_browser_src.ico come sorgente per evitare la
+    # degradazione iterativa che si verificherebbe riscrivendo logo_browser.ico
+    # su se stesso ad ogni build.
+    SRC_FILE = ROOT / "logo_browser_src.ico"
+    if not SRC_FILE.exists():
+        if ICON_FILE.exists():
+            shutil.copy2(str(ICON_FILE), str(SRC_FILE))
+            log(f"[OK] Sorgente originale salvato: {SRC_FILE.name}")
+        else:
+            log(f"[X] Icona non trovata: {ICON_FILE.name}")
+            log("    Metti logo_browser.ico nella cartella del progetto e riprova.")
+            sys.exit(1)
 
     from PIL import Image
 
-    src = Image.open(str(ICON_FILE)).convert("RGBA")
+    src = Image.open(str(SRC_FILE)).convert("RGBA")
     bbox = src.getbbox()
     content = src.crop(bbox)
 

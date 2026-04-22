@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
 """CalNav Browser — Modern spirit, classic roots."""
 
-__version__ = "1.0.0-alpha"
+__version__ = "1.1.0-alpha"
 
 import json
 import sys
 from pathlib import Path
+
+from typing import List, Optional
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QLineEdit, QPushButton, QStatusBar, QProgressBar, QLabel,
     QDialog, QDialogButtonBox, QTableWidget, QTableWidgetItem,
     QHeaderView, QScrollArea, QMessageBox,
+    QTabWidget, QTabBar, QMenu, QColorDialog, QInputDialog,
 )
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWebEngineCore import (
@@ -20,13 +23,15 @@ from PyQt6.QtWebEngineCore import (
 from PyQt6.QtWebChannel import QWebChannel
 from PyQt6.QtCore import (
     QUrl, Qt, QObject, pyqtSlot, pyqtSignal, QFile, QIODevice,
-    PYQT_VERSION_STR, QT_VERSION_STR, QTimer,
+    PYQT_VERSION_STR, QT_VERSION_STR, QTimer, QRect, QSize,
 )
-from PyQt6.QtGui import QFont, QIcon, QKeySequence, QShortcut
+from PyQt6.QtGui import QFont, QIcon, QKeySequence, QShortcut, QPainter, QColor
 from PyQt6.QtNetwork import QNetworkAccessManager, QNetworkRequest
 
 from calnav_profiles import ProfileManager, PROFILE_COLORS, DATA_DIR
 from calnav_passwords import PasswordManager
+from calnav_bookmarks import BookmarkManager, Bookmark, UNCATEGORIZED
+from calnav_session import TabGroup, SavedTab, SessionManager
 
 HOME_URL = "https://www.google.com"
 GITHUB_API_URL = (
@@ -772,6 +777,561 @@ class PasswordVaultDialog(QDialog):
         self._fill_table()
 
 
+# ── Bookmark helpers ─────────────────────────────────────────────────────────
+def _url_color(url: str) -> str:
+    """Colore deterministico basato sul dominio."""
+    try:
+        from urllib.parse import urlparse
+        host = urlparse(url).netloc or url
+    except Exception:
+        host = url
+    return PROFILE_COLORS[hash(host) % len(PROFILE_COLORS)]
+
+
+def _url_initial(url: str) -> str:
+    try:
+        from urllib.parse import urlparse
+        host = urlparse(url).netloc.lstrip("www.") or url
+        return host[0].upper() if host else "?"
+    except Exception:
+        return "?"
+
+
+# ── Add / Edit bookmark dialog ────────────────────────────────────────────────
+class AddBookmarkDialog(QDialog):
+    def __init__(self, url: str, title: str, bm_manager: BookmarkManager,
+                 bookmark: Bookmark = None, parent=None):
+        super().__init__(parent)
+        self._url = url
+        self._bm  = bookmark
+        self._mgr = bm_manager
+        self.setWindowTitle("Modifica preferito" if bookmark else "Aggiungi ai preferiti")
+        self.setFixedSize(400, 240)
+        self._build(title)
+
+    def _build(self, title: str):
+        self.setStyleSheet(f"background: {NAVY_MID}; color: {TEXT_BRIGHT};")
+        vbox = QVBoxLayout(self)
+        vbox.setContentsMargins(24, 20, 24, 16)
+        vbox.setSpacing(12)
+
+        # Nome
+        vbox.addWidget(self._lbl("Nome:"))
+        self._name = QLineEdit(self._bm.title if self._bm else title)
+        self._name.setFixedHeight(36)
+        self._name.setStyleSheet(self._field_css())
+        vbox.addWidget(self._name)
+
+        # Categoria
+        cat_row = QHBoxLayout()
+        cat_row.setSpacing(8)
+        vbox.addWidget(self._lbl("Categoria:"))
+        self._cat_combo = self._build_combo()
+        cat_row.addWidget(self._cat_combo, stretch=1)
+        btn_new_cat = QPushButton("+ Nuova")
+        btn_new_cat.setFixedHeight(34)
+        btn_new_cat.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_new_cat.setStyleSheet(f"""
+            QPushButton {{ background: rgba(0,212,255,0.12); color: {TEAL};
+                border: 1px solid {TEAL_DIM}; border-radius: 8px; padding: 0 10px; font-size: 11px; }}
+            QPushButton:hover {{ background: rgba(0,212,255,0.22); }}
+        """)
+        btn_new_cat.clicked.connect(self._new_category)
+        cat_row.addWidget(btn_new_cat)
+        vbox.addLayout(cat_row)
+
+        # Pin
+        self._pin_chk = QPushButton("  Fissa in alto")
+        self._pin_chk.setCheckable(True)
+        self._pin_chk.setChecked(self._bm.pinned if self._bm else False)
+        self._pin_chk.setFixedHeight(32)
+        self._pin_chk.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._pin_chk.setStyleSheet(f"""
+            QPushButton {{ background: transparent; color: {TEXT_DIM};
+                border: 1px solid #253852; border-radius: 8px; text-align: left; padding: 0 12px; font-size: 12px; }}
+            QPushButton:checked {{ color: {AMBER}; border-color: {AMBER_DIM}; background: rgba(245,166,35,0.08); }}
+            QPushButton:hover {{ border-color: {TEAL_DIM}; }}
+        """)
+        self._pin_chk.setText(("📌" if self._pin_chk.isChecked() else "☆") + "  Fissa in alto")
+        self._pin_chk.toggled.connect(
+            lambda c: self._pin_chk.setText(("📌" if c else "☆") + "  Fissa in alto")
+        )
+        vbox.addWidget(self._pin_chk)
+
+        vbox.addStretch()
+
+        # Bottoni
+        bottom = QHBoxLayout()
+        if self._bm:
+            btn_del = QPushButton("Rimuovi")
+            btn_del.setFixedHeight(34)
+            btn_del.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn_del.setStyleSheet(f"""
+                QPushButton {{ background: transparent; color: #FF6B6B;
+                    border: 1px solid rgba(255,107,107,0.4); border-radius: 8px; padding: 0 14px; }}
+                QPushButton:hover {{ background: rgba(255,107,107,0.12); }}
+            """)
+            btn_del.clicked.connect(lambda: self.done(2))
+            bottom.addWidget(btn_del)
+        bottom.addStretch()
+
+        btn_cancel = QPushButton("Annulla")
+        btn_cancel.setFixedHeight(34)
+        btn_cancel.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_cancel.setStyleSheet(f"""
+            QPushButton {{ background: transparent; color: {TEXT_DIM};
+                border: 1px solid #253852; border-radius: 8px; padding: 0 16px; }}
+            QPushButton:hover {{ color: {TEXT_BRIGHT}; border-color: {TEAL_DIM}; }}
+        """)
+        btn_cancel.clicked.connect(self.reject)
+        bottom.addWidget(btn_cancel)
+
+        btn_save = QPushButton("Salva")
+        btn_save.setFixedHeight(34)
+        btn_save.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_save.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
+        btn_save.setStyleSheet(f"""
+            QPushButton {{ background: {TEAL}; color: {NAVY_DEEP};
+                border: none; border-radius: 8px; padding: 0 20px; }}
+            QPushButton:hover {{ background: #33DDFF; }}
+        """)
+        btn_save.clicked.connect(self.accept)
+        bottom.addWidget(btn_save)
+        vbox.addLayout(bottom)
+
+    def _lbl(self, text: str) -> QLabel:
+        l = QLabel(text)
+        l.setStyleSheet(f"color: {TEXT_DIM}; font-size: 11px; letter-spacing: 1px;")
+        return l
+
+    def _field_css(self) -> str:
+        return f"""
+            QLineEdit {{ background: {NAVY_LIGHT}; color: {TEXT_BRIGHT};
+                border: 1.5px solid #253852; border-radius: 8px;
+                padding: 0 12px; font-size: 13px; }}
+            QLineEdit:focus {{ border-color: {TEAL}; }}
+        """
+
+    def _build_combo(self):
+        from PyQt6.QtWidgets import QComboBox
+        combo = QComboBox()
+        combo.setFixedHeight(34)
+        combo.setStyleSheet(f"""
+            QComboBox {{ background: {NAVY_LIGHT}; color: {TEXT_BRIGHT};
+                border: 1.5px solid #253852; border-radius: 8px;
+                padding: 0 12px; font-size: 12px; }}
+            QComboBox:focus {{ border-color: {TEAL}; }}
+            QComboBox::drop-down {{ border: none; width: 24px; }}
+            QComboBox QAbstractItemView {{
+                background: {NAVY_MID}; color: {TEXT_BRIGHT};
+                border: 1px solid #253852; selection-background-color: {TEAL};
+                selection-color: {NAVY_DEEP};
+            }}
+        """)
+        combo.addItem(UNCATEGORIZED)
+        for c in self._mgr.categories:
+            combo.addItem(c)
+        current = (self._bm.category if self._bm else UNCATEGORIZED)
+        idx = combo.findText(current)
+        if idx >= 0:
+            combo.setCurrentIndex(idx)
+        return combo
+
+    def _new_category(self):
+        from PyQt6.QtWidgets import QInputDialog
+        name, ok = QInputDialog.getText(self, "Nuova categoria", "Nome categoria:")
+        if ok and name.strip():
+            if self._mgr.add_category(name.strip()):
+                self._cat_combo.addItem(name.strip())
+                self._cat_combo.setCurrentText(name.strip())
+
+    def get_values(self):
+        return (
+            self._name.text().strip(),
+            self._cat_combo.currentText(),
+            self._pin_chk.isChecked(),
+        )
+
+
+# ── Bookmarks management dialog ───────────────────────────────────────────────
+class BookmarksDialog(QDialog):
+    navigate = pyqtSignal(str)   # url to open
+
+    def __init__(self, bm_manager: BookmarkManager, parent=None):
+        super().__init__(parent)
+        self._mgr = bm_manager
+        self._sel_category = "__pinned__"   # default: Fissati
+        self.setWindowTitle("Preferiti — CalNav")
+        self.resize(780, 520)
+        self._build()
+
+    def _build(self):
+        self.setStyleSheet(f"background: {NAVY_MID}; color: {TEXT_BRIGHT};")
+        root = QHBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        # ── Left panel ────────────────────────────────────────────────────────
+        left = QWidget()
+        left.setFixedWidth(200)
+        left.setStyleSheet(f"background: {NAVY_DEEP}; border-right: 1px solid #1C3050;")
+        lv = QVBoxLayout(left)
+        lv.setContentsMargins(0, 16, 0, 12)
+        lv.setSpacing(2)
+
+        hdr = QLabel("  PREFERITI")
+        hdr.setStyleSheet(f"color: {TEXT_DIM}; font-size: 10px; letter-spacing: 2px; font-weight: bold; padding-bottom: 8px;")
+        lv.addWidget(hdr)
+
+        # Categoria speciali
+        self._cat_btns: list = []
+        self._btn_pinned = self._make_cat_btn("📌  Fissati", "__pinned__",
+                                               self._mgr.count_pinned())
+        self._btn_all    = self._make_cat_btn("📁  Tutti",   "__all__",
+                                               self._mgr.count())
+        lv.addWidget(self._btn_pinned)
+        lv.addWidget(self._btn_all)
+
+        sep = QWidget()
+        sep.setFixedHeight(1)
+        sep.setStyleSheet(f"background: #1C3050; margin: 6px 12px;")
+        lv.addWidget(sep)
+
+        # Categorie utente (scrollabile)
+        self._cat_list_widget = QWidget()
+        self._cat_list_layout = QVBoxLayout(self._cat_list_widget)
+        self._cat_list_layout.setContentsMargins(0, 0, 0, 0)
+        self._cat_list_layout.setSpacing(2)
+        sc = QScrollArea()
+        sc.setWidgetResizable(True)
+        sc.setWidget(self._cat_list_widget)
+        sc.setStyleSheet("QScrollArea { border: none; background: transparent; }")
+        lv.addWidget(sc, stretch=1)
+
+        # Nuova categoria
+        btn_new_cat = QPushButton("  + Nuova categoria")
+        btn_new_cat.setFixedHeight(36)
+        btn_new_cat.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_new_cat.setStyleSheet(f"""
+            QPushButton {{ background: transparent; color: {TEAL};
+                border: none; text-align: left; font-size: 12px; padding: 0 12px; }}
+            QPushButton:hover {{ color: #33DDFF; }}
+        """)
+        btn_new_cat.clicked.connect(self._add_category)
+        lv.addWidget(btn_new_cat)
+
+        root.addWidget(left)
+
+        # ── Right panel ───────────────────────────────────────────────────────
+        right = QWidget()
+        rv = QVBoxLayout(right)
+        rv.setContentsMargins(16, 16, 16, 12)
+        rv.setSpacing(10)
+
+        # Search
+        self._search = QLineEdit()
+        self._search.setPlaceholderText("Cerca nei preferiti…")
+        self._search.setFixedHeight(36)
+        self._search.setStyleSheet(f"""
+            QLineEdit {{ background: {NAVY_LIGHT}; color: {TEXT_BRIGHT};
+                border: 1.5px solid #253852; border-radius: 10px;
+                padding: 0 14px; font-size: 12px; }}
+            QLineEdit:focus {{ border-color: {TEAL}; }}
+        """)
+        self._search.textChanged.connect(self._refresh_bookmarks)
+        rv.addWidget(self._search)
+
+        # Bookmark list
+        self._bm_widget = QWidget()
+        self._bm_layout = QVBoxLayout(self._bm_widget)
+        self._bm_layout.setContentsMargins(0, 0, 0, 0)
+        self._bm_layout.setSpacing(5)
+        sc2 = QScrollArea()
+        sc2.setWidgetResizable(True)
+        sc2.setWidget(self._bm_widget)
+        sc2.setStyleSheet("QScrollArea { border: none; background: transparent; }")
+        rv.addWidget(sc2, stretch=1)
+
+        # Close
+        bottom = QHBoxLayout()
+        bottom.addStretch()
+        btn_close = QPushButton("Chiudi")
+        btn_close.setFixedHeight(34)
+        btn_close.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_close.setStyleSheet(f"""
+            QPushButton {{ background: {TEAL}; color: {NAVY_DEEP}; border: none;
+                border-radius: 8px; padding: 0 24px; font-weight: bold; }}
+            QPushButton:hover {{ background: #33DDFF; }}
+        """)
+        btn_close.clicked.connect(self.accept)
+        bottom.addWidget(btn_close)
+        rv.addLayout(bottom)
+
+        root.addWidget(right, stretch=1)
+
+        self._refresh_categories()
+        self._refresh_bookmarks()
+
+    def _make_cat_btn(self, label: str, key: str, count: int) -> QPushButton:
+        btn = QPushButton(f"{label}  ({count})")
+        btn.setFixedHeight(36)
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.setCheckable(True)
+        btn.setChecked(key == self._sel_category)
+        btn._cat_key = key
+        self._cat_btns.append(btn)
+        btn.clicked.connect(lambda _, k=key: self._select_category(k))
+        self._apply_cat_style(btn)
+        return btn
+
+    def _apply_cat_style(self, btn: QPushButton):
+        active = getattr(btn, "_cat_key", "") == self._sel_category
+        btn.setStyleSheet(f"""
+            QPushButton {{
+                background: {"rgba(0,212,255,0.1)" if active else "transparent"};
+                color: {TEAL if active else TEXT_BRIGHT};
+                border: none; text-align: left; font-size: 12px;
+                padding: 0 16px; border-left: 3px solid {TEAL if active else "transparent"};
+            }}
+            QPushButton:hover {{ background: rgba(0,212,255,0.06); }}
+        """)
+
+    def _select_category(self, key: str):
+        self._sel_category = key
+        for btn in self._cat_btns:
+            self._apply_cat_style(btn)
+        self._refresh_bookmarks()
+
+    def _refresh_categories(self):
+        # Aggiorna contatori speciali
+        self._btn_pinned.setText(f"📌  Fissati  ({self._mgr.count_pinned()})")
+        self._btn_all.setText(f"📁  Tutti  ({self._mgr.count()})")
+
+        # Svuota categoria lista
+        while self._cat_list_layout.count():
+            item = self._cat_list_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        self._cat_btns = [self._btn_pinned, self._btn_all]
+
+        # Categorie utente
+        if self._mgr.categories:
+            for cat in self._mgr.categories:
+                row = self._make_cat_row(cat)
+                self._cat_list_layout.addWidget(row)
+
+        # Senza categoria
+        unc_count = self._mgr.count_uncategorized()
+        if unc_count > 0:
+            btn = self._make_cat_btn(f"📂  {UNCATEGORIZED}", UNCATEGORIZED, unc_count)
+            self._cat_list_layout.addWidget(btn)
+
+        self._cat_list_layout.addStretch()
+
+    def _make_cat_row(self, cat: str) -> QWidget:
+        row = QWidget()
+        row.setFixedHeight(36)
+        h = QHBoxLayout(row)
+        h.setContentsMargins(0, 0, 4, 0)
+        h.setSpacing(0)
+
+        count = self._mgr.count_by_category(cat)
+        btn = self._make_cat_btn(f"🗂  {cat}  ({count})", cat, count)
+        h.addWidget(btn, stretch=1)
+
+        btn_ren = QPushButton("✏")
+        btn_ren.setFixedSize(24, 24)
+        btn_ren.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_ren.setStyleSheet(f"QPushButton {{ background: transparent; color: {TEXT_DIM}; border: none; font-size: 11px; }} QPushButton:hover {{ color: {TEAL}; }}")
+        btn_ren.clicked.connect(lambda _, c=cat: self._rename_category(c))
+        h.addWidget(btn_ren)
+
+        btn_del = QPushButton("✕")
+        btn_del.setFixedSize(24, 24)
+        btn_del.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_del.setStyleSheet(f"QPushButton {{ background: transparent; color: {TEXT_DIM}; border: none; font-size: 11px; }} QPushButton:hover {{ color: #FF6B6B; }}")
+        btn_del.clicked.connect(lambda _, c=cat: self._delete_category(c))
+        h.addWidget(btn_del)
+
+        return row
+
+    def _refresh_bookmarks(self):
+        query = self._search.text().strip().lower()
+
+        if self._sel_category == "__pinned__":
+            bookmarks = self._mgr.get_pinned()
+        elif self._sel_category == "__all__":
+            bookmarks = self._mgr.get_all()
+        elif self._sel_category == UNCATEGORIZED:
+            bookmarks = self._mgr.get_uncategorized()
+        else:
+            bookmarks = self._mgr.get_by_category(self._sel_category)
+
+        if query:
+            bookmarks = [b for b in bookmarks
+                         if query in b.title.lower() or query in b.url.lower()]
+
+        while self._bm_layout.count():
+            item = self._bm_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        if not bookmarks:
+            empty = QLabel("Nessun preferito qui." if not query else "Nessun risultato.")
+            empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            empty.setStyleSheet(f"color: {TEXT_DIM}; font-size: 13px; padding: 40px;")
+            self._bm_layout.addWidget(empty)
+        else:
+            for bm in bookmarks:
+                card = self._make_bm_card(bm)
+                self._bm_layout.addWidget(card)
+
+        self._bm_layout.addStretch()
+
+    def _make_bm_card(self, bm: Bookmark) -> QWidget:
+        card = QWidget()
+        card.setFixedHeight(54)
+        card.setStyleSheet(f"""
+            QWidget {{
+                background: {NAVY_DEEP}; border-radius: 10px;
+                border: 1px solid {"#B87400" if bm.pinned else "#1C3050"};
+            }}
+        """)
+        h = QHBoxLayout(card)
+        h.setContentsMargins(10, 0, 10, 0)
+        h.setSpacing(10)
+
+        # Avatar sito
+        av = QLabel(_url_initial(bm.url))
+        av.setFixedSize(34, 34)
+        av.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        av.setStyleSheet(
+            f"background: {_url_color(bm.url)}; color: {NAVY_DEEP}; "
+            f"border-radius: 17px; font-weight: bold; font-size: 14px;"
+        )
+        h.addWidget(av)
+
+        # Testo
+        info = QVBoxLayout()
+        info.setSpacing(1)
+        title_lbl = QLabel(bm.title)
+        title_lbl.setStyleSheet(f"color: {TEXT_BRIGHT}; font-size: 13px; font-weight: bold; background: transparent; border: none;")
+        info.addWidget(title_lbl)
+        url_lbl = QLabel(bm.url[:60] + "…" if len(bm.url) > 60 else bm.url)
+        url_lbl.setStyleSheet(f"color: {TEXT_DIM}; font-size: 11px; background: transparent; border: none;")
+        info.addWidget(url_lbl)
+        h.addLayout(info, stretch=1)
+
+        # Pin indicator
+        if bm.pinned:
+            pin_lbl = QLabel("📌")
+            pin_lbl.setStyleSheet("background: transparent; border: none; font-size: 13px;")
+            h.addWidget(pin_lbl)
+
+        # Azioni
+        btn_open = QPushButton("Apri")
+        btn_open.setFixedSize(50, 28)
+        btn_open.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_open.setStyleSheet(f"""
+            QPushButton {{ background: rgba(0,212,255,0.12); color: {TEAL};
+                border: none; border-radius: 6px; font-size: 11px; font-weight: bold; }}
+            QPushButton:hover {{ background: rgba(0,212,255,0.25); }}
+        """)
+        btn_open.clicked.connect(lambda _, u=bm.url: self._open_url(u))
+        h.addWidget(btn_open)
+
+        btn_pin = QPushButton("📍" if bm.pinned else "☆")
+        btn_pin.setFixedSize(28, 28)
+        btn_pin.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_pin.setToolTip("Rimuovi pin" if bm.pinned else "Fissa in alto")
+        btn_pin.setStyleSheet(f"""
+            QPushButton {{ background: transparent; color: {AMBER if bm.pinned else TEXT_DIM};
+                border: none; border-radius: 5px; font-size: 14px; }}
+            QPushButton:hover {{ color: {AMBER}; }}
+        """)
+        btn_pin.clicked.connect(lambda _, b=bm: self._toggle_pin(b))
+        h.addWidget(btn_pin)
+
+        btn_edit = QPushButton("✏")
+        btn_edit.setFixedSize(28, 28)
+        btn_edit.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_edit.setStyleSheet(f"""
+            QPushButton {{ background: transparent; color: {TEXT_DIM};
+                border: none; border-radius: 5px; font-size: 13px; }}
+            QPushButton:hover {{ color: {TEAL}; }}
+        """)
+        btn_edit.clicked.connect(lambda _, b=bm: self._edit_bookmark(b))
+        h.addWidget(btn_edit)
+
+        btn_del = QPushButton("✕")
+        btn_del.setFixedSize(28, 28)
+        btn_del.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_del.setStyleSheet(f"""
+            QPushButton {{ background: transparent; color: {TEXT_DIM};
+                border: none; border-radius: 5px; font-size: 13px; }}
+            QPushButton:hover {{ color: #FF6B6B; }}
+        """)
+        btn_del.clicked.connect(lambda _, b=bm: self._delete_bookmark(b))
+        h.addWidget(btn_del)
+
+        return card
+
+    def _open_url(self, url: str):
+        self.navigate.emit(url)
+        self.accept()
+
+    def _toggle_pin(self, bm: Bookmark):
+        self._mgr.update(bm.id, pinned=not bm.pinned)
+        self._refresh_categories()
+        self._refresh_bookmarks()
+
+    def _edit_bookmark(self, bm: Bookmark):
+        dlg = AddBookmarkDialog(bm.url, bm.title, self._mgr, bookmark=bm, parent=self)
+        result = dlg.exec()
+        if result == QDialog.DialogCode.Accepted:
+            title, cat, pinned = dlg.get_values()
+            self._mgr.update(bm.id, title=title, category=cat, pinned=pinned)
+        elif result == 2:
+            self._mgr.remove(bm.id)
+        self._refresh_categories()
+        self._refresh_bookmarks()
+
+    def _delete_bookmark(self, bm: Bookmark):
+        self._mgr.remove(bm.id)
+        self._refresh_categories()
+        self._refresh_bookmarks()
+
+    def _add_category(self):
+        from PyQt6.QtWidgets import QInputDialog
+        name, ok = QInputDialog.getText(self, "Nuova categoria", "Nome categoria:")
+        if ok and name.strip():
+            self._mgr.add_category(name.strip())
+            self._refresh_categories()
+
+    def _rename_category(self, cat: str):
+        from PyQt6.QtWidgets import QInputDialog
+        name, ok = QInputDialog.getText(self, "Rinomina categoria", "Nuovo nome:", text=cat)
+        if ok and name.strip():
+            self._mgr.rename_category(cat, name.strip())
+            if self._sel_category == cat:
+                self._sel_category = name.strip()
+            self._refresh_categories()
+            self._refresh_bookmarks()
+
+    def _delete_category(self, cat: str):
+        reply = QMessageBox.question(
+            self, "Elimina categoria",
+            f"Eliminare \"{cat}\"?\nI preferiti verranno spostati in \"{UNCATEGORIZED}\".",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            self._mgr.delete_category(cat)
+            if self._sel_category == cat:
+                self._sel_category = "__all__"
+            self._refresh_categories()
+            self._refresh_bookmarks()
+
+
 # ── Update notification bar ──────────────────────────────────────────────────
 class UpdateBar(QWidget):
     def __init__(self, parent=None):
@@ -1014,6 +1574,239 @@ class SettingsDialog(QDialog):
         return self._settings
 
 
+# ── Custom tab bar with group colours and collapse support ────────────────────
+class CalNavTabBar(QTabBar):
+    """
+    Custom QTabBar:
+    • Group header tabs ("linguette") painted as solid coloured chips with white text.
+      Clicking them emits group_header_clicked — they are NEVER selected as current tab,
+      so the web view underneath never goes dark.
+    • Regular group tabs get a translucent tint + 4 px bottom stripe.
+    • A special pseudo-tab with data == _PLUS_DATA acts as the "+" new-tab button.
+      It is always kept at the end of the tab bar by CalNavWindow._ensure_plus_tab().
+      Clicking it emits new_tab_requested without ever becoming the current tab.
+    • Per-tab close buttons are added separately via setTabButton().
+    """
+
+    # Emits group_id when user left-clicks a linguetta header tab
+    group_header_clicked = pyqtSignal(str)
+    # Emits when "+" pseudo-tab is clicked
+    new_tab_requested = pyqtSignal()
+
+    # tabData prefix for group-header "linguetta" tabs
+    _HEADER_PREFIX = "__hdr__"
+    # tabData sentinel for the "+" pseudo-tab
+    _PLUS_DATA = "__plus__"
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._color_resolver = lambda gid: None   # group_id → str color | None
+        self.setDrawBase(False)
+        self.setElideMode(Qt.TextElideMode.ElideRight)
+        self.setExpanding(False)
+
+    def set_color_resolver(self, fn):
+        self._color_resolver = fn
+
+    # ── data helpers ─────────────────────────────────────────────────────────
+    @classmethod
+    def header_data(cls, group_id: str) -> str:
+        return cls._HEADER_PREFIX + group_id
+
+    @classmethod
+    def is_header_data(cls, data) -> bool:
+        return isinstance(data, str) and data.startswith(cls._HEADER_PREFIX)
+
+    @classmethod
+    def is_plus_data(cls, data) -> bool:
+        return data == cls._PLUS_DATA
+
+    @classmethod
+    def real_gid(cls, data: str) -> Optional[str]:
+        """Strip any prefix and return the bare group_id (or None if data is falsy)."""
+        if not data:
+            return None
+        if cls.is_header_data(data):
+            return data[len(cls._HEADER_PREFIX):]
+        return data
+
+    # ── size hints: make "+" pseudo-tab narrow ───────────────────────────────
+    def tabSizeHint(self, index: int) -> QSize:
+        if self.is_plus_data(self.tabData(index)):
+            return QSize(36, super().tabSizeHint(index).height())
+        return super().tabSizeHint(index)
+
+    def minimumTabSizeHint(self, index: int) -> QSize:
+        if self.is_plus_data(self.tabData(index)):
+            return QSize(36, super().minimumTabSizeHint(index).height())
+        return super().minimumTabSizeHint(index)
+
+    # ── mouse: intercept special tabs so Qt never "selects" them ─────────────
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            idx = self.tabAt(event.pos())
+            if idx >= 0:
+                data = self.tabData(idx)
+                if self.is_header_data(data):
+                    gid = self.real_gid(data)
+                    if gid:
+                        self.group_header_clicked.emit(gid)
+                    return          # do NOT call super — header stays unselected
+                if self.is_plus_data(data):
+                    self.new_tab_requested.emit()
+                    return          # do NOT call super — "+" stays unselected
+        super().mousePressEvent(event)
+
+    # ── painting ─────────────────────────────────────────────────────────────
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        try:
+            self._paint_group_overlays(painter)
+        finally:
+            painter.end()
+
+    def _paint_group_overlays(self, painter: QPainter):
+        for idx in range(self.count()):
+            raw = self.tabData(idx)
+            if not raw:
+                continue
+
+            # ── "+" pseudo-tab ────────────────────────────────────────────
+            if self.is_plus_data(raw):
+                rect = self.tabRect(idx)
+                # Erase Qt's default tab background by painting over it
+                bg = QColor(NAVY_DEEP)
+                painter.fillRect(rect, bg)
+                # Draw the "+" symbol in teal
+                painter.setPen(QColor(TEAL))
+                f = self.font()
+                f.setBold(True)
+                f.setPointSize(f.pointSize() + 3)
+                painter.setFont(f)
+                painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, "+")
+                continue
+
+            is_header = self.is_header_data(raw)
+            gid = self.real_gid(raw)
+            color = self._color_resolver(gid)
+            if not color:
+                continue
+            rect = self.tabRect(idx)
+            qc = QColor(color)
+
+            if is_header:
+                # ── Group "linguetta": solid colored chip with white label ──
+                chip = rect.adjusted(2, 3, -2, -3)
+                painter.fillRect(chip, qc)
+                painter.setPen(QColor("white"))
+                f = self.font()
+                f.setBold(True)
+                f.setPointSize(max(8, f.pointSize() - 1))
+                painter.setFont(f)
+                painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, self.tabText(idx))
+            else:
+                # ── Regular group tab: translucent tint + 4 px bottom stripe ──
+                tint = QColor(qc)
+                tint.setAlpha(45)
+                painter.fillRect(rect.adjusted(1, 1, -1, 0), tint)
+                painter.fillRect(rect.x() + 2, rect.bottom() - 3,
+                                 rect.width() - 4, 4, qc)
+
+
+# ── Group create / edit dialog ────────────────────────────────────────────────
+class GroupDialog(QDialog):
+    """Create or edit a tab group (name + color via color picker)."""
+
+    def __init__(self, group: Optional[TabGroup] = None, parent=None):
+        super().__init__(parent)
+        self._group = group
+        self.selected_color = group.color if group else PROFILE_COLORS[2]
+        self.setWindowTitle("Modifica gruppo" if group else "Nuovo gruppo schede")
+        self.setFixedSize(380, 210)
+        self._build()
+
+    def _build(self):
+        self.setStyleSheet(f"background: {NAVY_MID}; color: {TEXT_BRIGHT};")
+        vbox = QVBoxLayout(self)
+        vbox.setContentsMargins(24, 20, 24, 16)
+        vbox.setSpacing(12)
+
+        lbl = QLabel("Nome gruppo:")
+        lbl.setStyleSheet(f"color: {TEXT_BRIGHT}; font-size: 13px;")
+        vbox.addWidget(lbl)
+
+        self.name_edit = QLineEdit(self._group.name if self._group else "")
+        self.name_edit.setPlaceholderText("es. Lavoro, Ricerca, Personale…")
+        self.name_edit.setFixedHeight(36)
+        self.name_edit.setStyleSheet(f"""
+            QLineEdit {{
+                background: {NAVY_LIGHT}; color: {TEXT_BRIGHT};
+                border: 1.5px solid #253852; border-radius: 8px;
+                padding: 0 12px; font-size: 13px;
+            }}
+            QLineEdit:focus {{ border-color: {TEAL}; }}
+        """)
+        vbox.addWidget(self.name_edit)
+
+        color_row = QHBoxLayout()
+        color_row.setSpacing(12)
+        color_lbl = QLabel("Colore:")
+        color_lbl.setStyleSheet(f"color: {TEXT_BRIGHT}; font-size: 13px;")
+        color_row.addWidget(color_lbl)
+
+        self._color_btn = QPushButton()
+        self._color_btn.setFixedSize(40, 36)
+        self._color_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._color_btn.setToolTip("Scegli colore…")
+        self._refresh_color_btn()
+        self._color_btn.clicked.connect(self._pick_color)
+        color_row.addWidget(self._color_btn)
+        color_row.addStretch()
+        vbox.addLayout(color_row)
+
+        vbox.addStretch()
+
+        btns = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        btns.setStyleSheet(f"""
+            QPushButton {{
+                background: {TEAL}; color: {NAVY_DEEP};
+                border: none; border-radius: 6px;
+                padding: 6px 18px; font-weight: bold; min-width: 80px;
+            }}
+            QPushButton:hover {{ background: #33DDFF; }}
+            QPushButton[text="Cancel"] {{ background: transparent; color: {TEXT_DIM};
+                border: 1px solid #253852; }}
+        """)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        vbox.addWidget(btns)
+
+    def _refresh_color_btn(self):
+        self._color_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: {self.selected_color};
+                border-radius: 8px;
+                border: 2px solid rgba(255,255,255,0.25);
+            }}
+            QPushButton:hover {{ border-color: white; }}
+        """)
+
+    def _pick_color(self):
+        color = QColorDialog.getColor(
+            QColor(self.selected_color), self, "Scegli il colore del gruppo"
+        )
+        if color.isValid():
+            self.selected_color = color.name()
+            self._refresh_color_btn()
+
+    def get_values(self):
+        return self.name_edit.text().strip(), self.selected_color
+
+
 # ── Main window ───────────────────────────────────────────────────────────────
 class CalNavWindow(QMainWindow):
     def __init__(self):
@@ -1025,31 +1818,39 @@ class CalNavWindow(QMainWindow):
 
         self._settings = _load_settings()
         self.profile_manager = ProfileManager()
+        self._groups: List[TabGroup] = []        # active tab groups
+        self._collapsed_groups: set = set()      # group_ids currently collapsed
 
-        self._build_ui()
+        self._build_ui()   # builds tab widget + toolbar (no tabs yet)
 
         prof = self.profile_manager.current
         self.password_manager = PasswordManager(prof.passwords_file, prof.name)
+        self.bookmark_manager = BookmarkManager(prof.bookmarks_file)
 
+        # Shared bridge + channel (all tabs share the same bridge)
         self._bridge = CalNavBridge(self)
         self._bridge.save_password_requested.connect(self._on_save_request)
         self._channel = QWebChannel(self)
         self._channel.registerObject("calnav_bridge", self._bridge)
 
+        # Named web profile (shared by all tabs)
         self._web_profile = QWebEngineProfile(prof.name, self)
-        self._web_page = QWebEnginePage(self._web_profile, self)
-        self._web_page.setWebChannel(self._channel)
-        self.webview.setPage(self._web_page)
-
         self._apply_profile_settings()
+
         self._setup_shortcuts()
         self._update_profile_button()
-        self.load(self._settings["homepage"])
+        self._restore_session()   # opens tabs from saved session (or homepage)
 
         # Controlla aggiornamenti 5 secondi dopo l'avvio
         self._updater = UpdateChecker(self)
         self._updater.update_available.connect(self._update_bar.show_update)
         QTimer.singleShot(5000, self._updater.check)
+
+    # ── Current tab accessor ──────────────────────────────────────────────────
+    @property
+    def webview(self) -> Optional[QWebEngineView]:
+        w = self._tab_widget.currentWidget()
+        return w if isinstance(w, QWebEngineView) else None
 
     # ── Profile / password helpers ────────────────────────────────────────────
     def _apply_profile_settings(self):
@@ -1110,27 +1911,29 @@ class CalNavWindow(QMainWindow):
         self.setWindowTitle(f"CalNav — {prof.display_name}")
 
     def _switch_profile(self, name: str):
+        # Save session for old profile before switching
+        self._save_session()
+
         self.profile_manager.set_current(name)
         prof = self.profile_manager.current
 
         self.password_manager = PasswordManager(prof.passwords_file, prof.name)
+        self.bookmark_manager = BookmarkManager(prof.bookmarks_file)
         self._save_bar.hide()
 
         old_profile = self._web_profile
-        old_page = self._web_page
-
         self._web_profile = QWebEngineProfile(prof.name, self)
-        self._web_page = QWebEnginePage(self._web_profile, self)
-        self._web_page.setWebChannel(self._channel)
         self._apply_profile_settings()
-        self.webview.setPage(self._web_page)
 
-        old_page.deleteLater()
+        # Clear all existing tabs, then restore session for new profile
+        self._clear_all_tabs()
+        self._groups = []
+        self._collapsed_groups = set()
         old_profile.deleteLater()
 
         self._update_profile_button()
+        self._restore_session()
         self.statusBar().showMessage(f"Profilo: {prof.display_name}", 3000)
-        self.webview.reload()
 
     def _open_profile_dialog(self):
         dlg = ProfileDialog(self.profile_manager, self)
@@ -1140,6 +1943,49 @@ class CalNavWindow(QMainWindow):
     def _open_password_vault(self):
         dlg = PasswordVaultDialog(self.password_manager, self)
         dlg.exec()
+
+    def _toggle_bookmark(self):
+        url   = self.address_bar.text().strip()
+        title = (self.webview.title() if self.webview else None) or url
+        existing = self.bookmark_manager.is_bookmarked(url)
+        dlg = AddBookmarkDialog(url, title, self.bookmark_manager,
+                                bookmark=existing, parent=self)
+        result = dlg.exec()
+        if result == QDialog.DialogCode.Accepted:
+            name, cat, pinned = dlg.get_values()
+            if existing:
+                self.bookmark_manager.update(existing.id, title=name, category=cat, pinned=pinned)
+            else:
+                self.bookmark_manager.add(url, name, cat, pinned)
+        elif result == 2 and existing:
+            self.bookmark_manager.remove(existing.id)
+        self._update_star_button(url)
+
+    def _open_bookmarks(self):
+        dlg = BookmarksDialog(self.bookmark_manager, self)
+        dlg.navigate.connect(self.load)
+        dlg.exec()
+        self._update_star_button(self.address_bar.text().strip())
+
+    def _update_star_button(self, url: str = ""):
+        url = url or self.address_bar.text().strip()
+        if self.bookmark_manager.is_bookmarked(url):
+            self.btn_star.setText("\u2605")   # stella piena
+            self.btn_star.setStyleSheet(self.btn_star.styleSheet().replace("#7AB8E8", AMBER))
+            self.btn_star.setToolTip("Modifica preferito  Ctrl+D")
+        else:
+            self.btn_star.setText("\u2606")   # stella vuota
+            self.btn_star.setToolTip("Aggiungi ai preferiti  Ctrl+D")
+        # Ripristina style corretto
+        self.btn_star.setStyleSheet(f"""
+            QPushButton {{
+                background: transparent;
+                color: {"#F5A623" if self.bookmark_manager.is_bookmarked(url) else "#7AB8E8"};
+                border: none; border-radius: 19px; font-size: 18px;
+            }}
+            QPushButton:hover   {{ background: {BTN_HOVER}; color: {"#FFB84D" if self.bookmark_manager.is_bookmarked(url) else TEAL}; }}
+            QPushButton:pressed {{ background: {BTN_PRESS}; }}
+        """)
 
     def _open_settings(self):
         dlg = SettingsDialog(self._settings, self)
@@ -1158,25 +2004,649 @@ class CalNavWindow(QMainWindow):
     # ── Shortcuts ─────────────────────────────────────────────────────────────
     def _setup_shortcuts(self):
         QShortcut(QKeySequence("Ctrl+L"),         self, self._focus_address_bar)
-        QShortcut(QKeySequence("F5"),             self, self.webview.reload)
-        QShortcut(QKeySequence("Escape"),         self, self.webview.stop)
-        QShortcut(QKeySequence("Alt+Left"),       self, self.webview.back)
-        QShortcut(QKeySequence("Alt+Right"),      self, self.webview.forward)
+        QShortcut(QKeySequence("F5"),             self, lambda: self.webview.reload() if self.webview else None)
+        QShortcut(QKeySequence("Escape"),         self, lambda: self.webview.stop()   if self.webview else None)
+        QShortcut(QKeySequence("Alt+Left"),       self, lambda: self.webview.back()   if self.webview else None)
+        QShortcut(QKeySequence("Alt+Right"),      self, lambda: self.webview.forward() if self.webview else None)
         QShortcut(QKeySequence("Ctrl+H"),         self, lambda: self.load(self._settings["homepage"]))
         QShortcut(QKeySequence("Ctrl+I"),         self, self._toggle_ie_mode)
         QShortcut(QKeySequence("F12"),            self, self._open_devtools)
+        QShortcut(QKeySequence("Ctrl+D"),         self, self._toggle_bookmark)
+        QShortcut(QKeySequence("Ctrl+Shift+B"),   self, self._open_bookmarks)
         QShortcut(QKeySequence("Ctrl+Shift+P"),   self, self._open_profile_dialog)
         QShortcut(QKeySequence("Ctrl+Shift+K"),   self, self._open_password_vault)
         QShortcut(QKeySequence("Ctrl+,"),         self, self._open_settings)
+        # Tab management
+        QShortcut(QKeySequence("Ctrl+T"),         self, lambda: self._new_tab(self._settings["homepage"]))
+        QShortcut(QKeySequence("Ctrl+W"),         self, lambda: self._close_tab(self._tab_widget.currentIndex()))
+        QShortcut(QKeySequence("Ctrl+Tab"),       self, self._next_tab)
+        QShortcut(QKeySequence("Ctrl+Shift+Tab"), self, self._prev_tab)
 
     def _focus_address_bar(self):
         self.address_bar.setFocus()
         self.address_bar.selectAll()
 
     def _open_devtools(self):
-        self.webview.page().triggerAction(
-            self.webview.page().WebAction.InspectElement
+        if self.webview:
+            self.webview.page().triggerAction(
+                self.webview.page().WebAction.InspectElement
+            )
+
+    def _next_tab(self):
+        n = self._tab_widget.count()
+        if n > 1:
+            self._tab_widget.setCurrentIndex(
+                (self._tab_widget.currentIndex() + 1) % n
+            )
+
+    def _prev_tab(self):
+        n = self._tab_widget.count()
+        if n > 1:
+            self._tab_widget.setCurrentIndex(
+                (self._tab_widget.currentIndex() - 1) % n
+            )
+
+    # ── Tab management ────────────────────────────────────────────────────────
+    def _ensure_plus_tab(self):
+        """Keep a '+' pseudo-tab always at the very end of the tab bar.
+
+        Removes any existing '+' tab(s), then appends a fresh one at the end.
+        Call this after every structural change (new tab, close tab, rebuild headers,
+        session restore).  The "+" tab is painted by CalNavTabBar._paint_group_overlays;
+        clicking it emits new_tab_requested without ever becoming the current tab.
+        """
+        # Remove all existing "+" pseudo-tabs (there should normally be at most one)
+        to_remove = [i for i in range(self._tab_bar.count())
+                     if CalNavTabBar.is_plus_data(self._tab_bar.tabData(i))]
+        for i in reversed(to_remove):
+            w = self._tab_widget.widget(i)
+            self._tab_widget.removeTab(i)
+            if w:
+                w.deleteLater()
+        # Append a new "+" pseudo-tab at the end
+        placeholder = QWidget()
+        idx = self._tab_widget.addTab(placeholder, "")
+        self._tab_bar.setTabData(idx, CalNavTabBar._PLUS_DATA)
+        # Make sure it has no close button
+        self._tab_bar.setTabButton(idx, QTabBar.ButtonPosition.RightSide, None)
+        self._tab_bar.setTabButton(idx, QTabBar.ButtonPosition.LeftSide, None)
+
+    def _new_tab(self, url: str = "", group_id: Optional[str] = None,
+                 activate: bool = True) -> QWebEngineView:
+        """Create a new tab with its own page, optionally in a group."""
+        view = QWebEngineView()
+        page = QWebEnginePage(self._web_profile, view)
+        page.setWebChannel(self._channel)
+        view.setPage(page)
+
+        # Connect signals
+        view.urlChanged.connect(self._on_url_changed)
+        view.loadProgress.connect(self._on_load_progress)
+        view.loadStarted.connect(self._on_load_started)
+        view.loadFinished.connect(self._on_load_finished)
+        view.titleChanged.connect(self._on_title_changed)
+
+        idx = self._tab_widget.addTab(view, "Nuova scheda")
+        self._tab_bar.setTabData(idx, group_id)
+
+        # Ensure group header "linguetta" is present (may shift indices)
+        if group_id:
+            self._ensure_group_header(group_id)
+
+        # Re-find tab index after possible header / "+" insertion
+        idx = self._tab_widget.indexOf(view)
+
+        # Visible × close button
+        btn_close = QPushButton("×")
+        btn_close.setFixedSize(16, 16)
+        btn_close.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_close.setToolTip("Chiudi scheda")
+        btn_close.setStyleSheet(f"""
+            QPushButton {{
+                background: transparent;
+                color: {TEXT_DIM};
+                border: none;
+                border-radius: 8px;
+                font-size: 14px;
+                font-weight: bold;
+                padding: 0;
+            }}
+            QPushButton:hover {{
+                background: rgba(255,107,107,0.30);
+                color: #FF6B6B;
+            }}
+        """)
+        btn_close.clicked.connect(lambda: self._close_tab_by_view(view))
+        self._tab_bar.setTabButton(idx, QTabBar.ButtonPosition.RightSide, btn_close)
+
+        # Keep "+" pseudo-tab at the end (new tab was appended, possibly after "+")
+        self._ensure_plus_tab()
+
+        # Re-find index after _ensure_plus_tab may have shifted things
+        idx = self._tab_widget.indexOf(view)
+
+        if activate:
+            self._tab_widget.setCurrentIndex(idx)
+
+        if url:
+            self._load_in_view(view, url)
+
+        return view
+
+    def _close_tab_by_view(self, view: QWebEngineView):
+        """Close the tab that contains *view* (used by per-tab close buttons)."""
+        idx = self._tab_widget.indexOf(view)
+        if idx >= 0:
+            self._close_tab(idx)
+
+    def _ensure_group_header(self, group_id: str):
+        """Insert a group-header 'linguetta' tab immediately before the first real
+        tab of *group_id*, if no header is already present."""
+        g = self._get_group(group_id)
+        if not g:
+            return
+        header_data = CalNavTabBar.header_data(group_id)
+        # Check if header already exists
+        for i in range(self._tab_bar.count()):
+            if self._tab_bar.tabData(i) == header_data:
+                return
+        # Find first real tab with this group_id
+        first_real = -1
+        for i in range(self._tab_bar.count()):
+            if self._tab_bar.tabData(i) == group_id:
+                first_real = i
+                break
+        if first_real < 0:
+            return  # no real tabs to head yet
+        is_collapsed = group_id in self._collapsed_groups
+        label = f"▶ {g.name}" if is_collapsed else f"▼ {g.name}"
+        placeholder = QWidget()
+        idx = self._tab_widget.insertTab(first_real, placeholder, label)
+        self._tab_bar.setTabData(idx, header_data)
+
+    def _maybe_remove_group_header(self, group_id: str):
+        """Remove the group-header tab if no real tabs remain in the group."""
+        has_real = any(
+            self._tab_bar.tabData(i) == group_id
+            for i in range(self._tab_bar.count())
         )
+        if has_real:
+            return
+        header_data = CalNavTabBar.header_data(group_id)
+        to_remove = [i for i in range(self._tab_bar.count())
+                     if self._tab_bar.tabData(i) == header_data]
+        for i in reversed(to_remove):
+            w = self._tab_widget.widget(i)
+            self._tab_widget.removeTab(i)
+            if w:
+                w.deleteLater()
+
+    def _close_tab(self, index: int):
+        """Close a tab. Group-header and '+' tabs are ignored; always keeps ≥1 real tab."""
+        if index < 0 or index >= self._tab_widget.count():
+            return
+        raw = self._tab_bar.tabData(index)
+        # Never close a group-header linguetta tab or the "+" pseudo-tab
+        if CalNavTabBar.is_header_data(raw) or CalNavTabBar.is_plus_data(raw):
+            return
+        group_id = raw if raw else None
+        # Count real (non-header, non-plus) web views
+        real_count = sum(
+            1 for i in range(self._tab_widget.count())
+            if isinstance(self._tab_widget.widget(i), QWebEngineView)
+        )
+        if real_count <= 1:
+            self.load(self._settings["homepage"])
+            return
+        view = self._tab_widget.widget(index)
+        self._tab_widget.removeTab(index)
+        if isinstance(view, QWebEngineView):
+            try:
+                view.urlChanged.disconnect(self._on_url_changed)
+                view.loadProgress.disconnect(self._on_load_progress)
+                view.loadStarted.disconnect(self._on_load_started)
+                view.loadFinished.disconnect(self._on_load_finished)
+                view.titleChanged.disconnect(self._on_title_changed)
+            except Exception:
+                pass
+            view.setPage(QWebEnginePage())   # detach shared profile page
+        if view:
+            view.deleteLater()
+        # Remove group header if no more real tabs belong to that group
+        if group_id:
+            self._maybe_remove_group_header(group_id)
+
+    def _clear_all_tabs(self):
+        """Remove all tabs without creating a replacement (used on profile switch)."""
+        while self._tab_widget.count() > 0:
+            view = self._tab_widget.widget(0)
+            self._tab_widget.removeTab(0)
+            if isinstance(view, QWebEngineView):
+                try:
+                    view.urlChanged.disconnect(self._on_url_changed)
+                    view.loadProgress.disconnect(self._on_load_progress)
+                    view.loadStarted.disconnect(self._on_load_started)
+                    view.loadFinished.disconnect(self._on_load_finished)
+                    view.titleChanged.disconnect(self._on_title_changed)
+                except Exception:
+                    pass
+                view.setPage(QWebEnginePage())
+            if view:
+                view.deleteLater()
+
+    def _on_tab_changed(self, index: int):
+        """Update toolbar state to reflect newly-selected tab."""
+        if index < 0:
+            return
+
+        raw_data = self._tab_bar.tabData(index)
+
+        # Header or "+" pseudo-tab got selected (Qt auto-selected it after
+        # a collapse or a tab removal — header clicks are intercepted in
+        # mousePressEvent and never reach here normally).
+        # Silently redirect focus to the nearest visible real tab.
+        if CalNavTabBar.is_header_data(raw_data) or CalNavTabBar.is_plus_data(raw_data):
+            for i in range(self._tab_widget.count()):
+                d = self._tab_bar.tabData(i)
+                if (self._tab_bar.isTabVisible(i)
+                        and not CalNavTabBar.is_header_data(d)
+                        and not CalNavTabBar.is_plus_data(d)):
+                    self._tab_widget.setCurrentIndex(i)
+                    # _on_tab_changed will be called again with the real tab index
+                    return
+            return   # no real tab visible yet (e.g. during startup)
+
+        view = self._tab_widget.widget(index)
+        if not isinstance(view, QWebEngineView):
+            return
+        url = view.url().toString()
+        if url and url != "about:blank":
+            self.address_bar.setText(url)
+        else:
+            self.address_bar.clear()
+        h = view.history()
+        self.btn_back.setEnabled(h.canGoBack())
+        self.btn_forward.setEnabled(h.canGoForward())
+        self._update_star_button(url)
+        title = view.title()
+        prof = self.profile_manager.current
+        suffix = f"  —  CalNav [{prof.display_name}]"
+        self.setWindowTitle(f"{title}{suffix}" if title else f"CalNav [{prof.display_name}]")
+
+    # ── Group management ──────────────────────────────────────────────────────
+    def _get_group_color(self, group_id: str) -> Optional[str]:
+        for g in self._groups:
+            if g.id == group_id:
+                return g.color
+        return None
+
+    def _get_group(self, group_id: str) -> Optional[TabGroup]:
+        return next((g for g in self._groups if g.id == group_id), None)
+
+    def _show_tab_context_menu(self, pos):
+        """Right-click context menu on the tab bar."""
+        index = self._tab_bar.tabAt(pos)
+        menu = QMenu(self)
+        menu.setStyleSheet(f"""
+            QMenu {{
+                background: {NAVY_MID}; color: {TEXT_BRIGHT};
+                border: 1px solid #253852; border-radius: 8px; padding: 4px;
+            }}
+            QMenu::item {{ padding: 6px 20px 6px 12px; border-radius: 5px; }}
+            QMenu::item:selected {{ background: rgba(0,212,255,0.15); color: {TEAL}; }}
+            QMenu::separator {{ height: 1px; background: #253852; margin: 4px 8px; }}
+        """)
+
+        if index >= 0:
+            raw_data = self._tab_bar.tabData(index)
+            is_header = CalNavTabBar.is_header_data(raw_data)
+
+            if is_header:
+                # Right-clicked on a group-header linguetta
+                gid = CalNavTabBar.real_gid(raw_data)
+                g = self._get_group(gid)
+                is_col = gid in self._collapsed_groups
+                lbl = f"{'▶  Espandi' if is_col else '▼  Comprimi'} gruppo «{g.name if g else '?'}»"
+                act_exp = menu.addAction(lbl)
+                act_exp.triggered.connect(lambda: self._toggle_group_collapse(gid))
+                if g:
+                    menu.addSeparator()
+                    act_edit = menu.addAction("✏  Modifica gruppo…")
+                    act_edit.triggered.connect(lambda: self._edit_group(gid))
+                    act_del = menu.addAction("✕  Elimina gruppo")
+                    act_del.triggered.connect(lambda: self._delete_group(gid))
+            else:
+                current_gid = raw_data  # str | None
+                current_group = self._get_group(current_gid) if current_gid else None
+
+                # Collapse/expand for grouped tab
+                if current_gid:
+                    is_col = current_gid in self._collapsed_groups
+                    lbl = f"{'▶  Espandi' if is_col else '▼  Comprimi'} gruppo «{current_group.name if current_group else '?'}»"
+                    act_col = menu.addAction(lbl)
+                    act_col.triggered.connect(lambda: self._toggle_group_collapse(current_gid))
+                    menu.addSeparator()
+
+                # Group assignment submenu
+                grp_menu = menu.addMenu("📂  Assegna gruppo")
+                grp_menu.setStyleSheet(menu.styleSheet())
+
+                act_no_grp = grp_menu.addAction("Nessun gruppo")
+                act_no_grp.setCheckable(True)
+                act_no_grp.setChecked(current_gid is None)
+                act_no_grp.triggered.connect(lambda: self._assign_tab_group(index, None))
+
+                if self._groups:
+                    grp_menu.addSeparator()
+                    for g in self._groups:
+                        act = grp_menu.addAction(f"● {g.name}")
+                        act.setCheckable(True)
+                        act.setChecked(g.id == current_gid)
+                        act.triggered.connect(lambda _, gid=g.id: self._assign_tab_group(index, gid))
+
+                grp_menu.addSeparator()
+                act_new_grp = grp_menu.addAction("＋  Nuovo gruppo…")
+                act_new_grp.triggered.connect(lambda: self._create_group_and_assign(index))
+
+                if current_gid:
+                    act_edit_grp = menu.addAction(f"✏  Modifica gruppo «{current_group.name if current_group else '?'}»")
+                    act_edit_grp.triggered.connect(lambda: self._edit_group(current_gid))
+
+                menu.addSeparator()
+                act_dup = menu.addAction("⧉  Duplica scheda")
+                act_dup.triggered.connect(lambda: self._duplicate_tab(index))
+
+                act_new = menu.addAction("＋  Nuova scheda")
+                act_new.triggered.connect(lambda: self._new_tab(self._settings["homepage"]))
+
+                menu.addSeparator()
+                act_close = menu.addAction("✕  Chiudi scheda  Ctrl+W")
+                act_close.triggered.connect(lambda: self._close_tab(index))
+        else:
+            # Clicked on empty area of tab bar
+            act_new = menu.addAction("＋  Nuova scheda  Ctrl+T")
+            act_new.triggered.connect(lambda: self._new_tab(self._settings["homepage"]))
+
+        # Groups management
+        if self._groups:
+            menu.addSeparator()
+            act_manage = menu.addAction("⚙  Gestisci gruppi…")
+            act_manage.triggered.connect(self._manage_groups)
+
+        menu.exec(self._tab_bar.mapToGlobal(pos))
+
+    def _assign_tab_group(self, index: int, group_id: Optional[str]):
+        old_raw = self._tab_bar.tabData(index)
+        old_gid = old_raw if (old_raw and not CalNavTabBar.is_header_data(old_raw)) else None
+        self._tab_bar.setTabData(index, group_id)
+        if group_id:
+            self._ensure_group_header(group_id)
+        if old_gid and old_gid != group_id:
+            self._maybe_remove_group_header(old_gid)
+        self._tab_bar.update()
+
+    def _create_group_and_assign(self, tab_index: int):
+        dlg = GroupDialog(parent=self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            name, color = dlg.get_values()
+            if name:
+                g = TabGroup.new(name, color)
+                self._groups.append(g)
+                self._assign_tab_group(tab_index, g.id)
+
+    def _edit_group(self, group_id: str):
+        g = self._get_group(group_id)
+        if not g:
+            return
+        dlg = GroupDialog(group=g, parent=self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            name, color = dlg.get_values()
+            if name:
+                g.name = name
+                g.color = color
+                self._tab_bar.update()
+
+    def _manage_groups(self):
+        """Simple groups management: list + delete."""
+        if not self._groups:
+            return
+        menu = QMenu(self)
+        menu.setStyleSheet(f"""
+            QMenu {{
+                background: {NAVY_MID}; color: {TEXT_BRIGHT};
+                border: 1px solid #253852; border-radius: 8px; padding: 4px;
+            }}
+            QMenu::item {{ padding: 6px 20px 6px 12px; border-radius: 5px; }}
+            QMenu::item:selected {{ background: rgba(0,212,255,0.15); color: {TEAL}; }}
+        """)
+        for g in list(self._groups):
+            act = menu.addAction(f"✕  Elimina «{g.name}»")
+            act.triggered.connect(lambda _, gid=g.id: self._delete_group(gid))
+        menu.exec(self.cursor().pos())
+
+    def _delete_group(self, group_id: str):
+        # Reveal hidden tabs first (expand without calling toggle to avoid side-effects)
+        if group_id in self._collapsed_groups:
+            self._collapsed_groups.discard(group_id)
+            for i in range(self._tab_bar.count()):
+                if self._tab_bar.tabData(i) == group_id:
+                    self._tab_bar.setTabVisible(i, True)
+        # Remove the group-header linguetta tab
+        header_data = CalNavTabBar.header_data(group_id)
+        to_remove = [i for i in range(self._tab_bar.count())
+                     if self._tab_bar.tabData(i) == header_data]
+        for i in reversed(to_remove):
+            w = self._tab_widget.widget(i)
+            self._tab_widget.removeTab(i)
+            if w:
+                w.deleteLater()
+        self._groups = [g for g in self._groups if g.id != group_id]
+        self._collapsed_groups.discard(group_id)
+        # Remove group assignment from all tabs that used it
+        for i in range(self._tab_bar.count()):
+            if self._tab_bar.tabData(i) == group_id:
+                self._tab_bar.setTabData(i, None)
+        self._tab_bar.update()
+
+    def _toggle_group_collapse(self, group_id: str):
+        """Collapse or expand a group via its header 'linguetta' tab."""
+        g = self._get_group(group_id)
+        if not g:
+            return
+
+        header_data = CalNavTabBar.header_data(group_id)
+
+        if group_id in self._collapsed_groups:
+            # ── EXPAND ──────────────────────────────────────────────────────
+            self._collapsed_groups.discard(group_id)
+            first_real = -1
+            for i in range(self._tab_bar.count()):
+                d = self._tab_bar.tabData(i)
+                if d == group_id:
+                    self._tab_bar.setTabVisible(i, True)
+                    if first_real < 0:
+                        first_real = i
+                elif d == header_data:
+                    self._tab_widget.setTabText(i, f"▼ {g.name}")
+            # Jump to the first tab of the now-expanded group
+            if first_real >= 0:
+                self._tab_widget.setCurrentIndex(first_real)
+                self._on_tab_changed(first_real)
+        else:
+            # ── COLLAPSE ────────────────────────────────────────────────────
+            cur = self._tab_widget.currentIndex()
+            cur_data = self._tab_bar.tabData(cur) if cur >= 0 else None
+            on_this_group = (
+                cur_data == group_id
+                or (cur >= 0 and not self._tab_bar.isTabVisible(cur))
+                or CalNavTabBar.is_header_data(cur_data)
+                or CalNavTabBar.is_plus_data(cur_data)
+            )
+
+            if on_this_group:
+                # Must switch BEFORE hiding tabs, otherwise Qt auto-selects the
+                # header (empty QWidget) and causes an ugly blank-page flash.
+                # Find the nearest visible real tab that is NOT in this group.
+                alternative = -1
+                for i in range(self._tab_widget.count()):
+                    d = self._tab_bar.tabData(i)
+                    if (i != cur
+                            and self._tab_bar.isTabVisible(i)
+                            and not CalNavTabBar.is_header_data(d)
+                            and not CalNavTabBar.is_plus_data(d)
+                            and d != group_id):
+                        alternative = i
+                        break
+                if alternative < 0:
+                    # Every visible real tab belongs to this group — abort collapse
+                    # rather than showing a blank screen.
+                    self._tab_bar.update()
+                    return
+                # Switch to the alternative tab first, then hide the group
+                self._tab_widget.setCurrentIndex(alternative)
+                self._on_tab_changed(alternative)
+
+            self._collapsed_groups.add(group_id)
+            for i in range(self._tab_bar.count()):
+                d = self._tab_bar.tabData(i)
+                if d == group_id:
+                    self._tab_bar.setTabVisible(i, False)
+                elif d == header_data:
+                    self._tab_widget.setTabText(i, f"▶ {g.name}")
+
+        self._tab_bar.update()
+
+    def _apply_collapsed_groups(self):
+        """Called after session restore to re-collapse groups that were collapsed."""
+        for group_id in list(self._collapsed_groups):
+            self._collapsed_groups.discard(group_id)   # will be re-added by toggle
+            self._toggle_group_collapse(group_id)
+
+    def _rebuild_headers(self):
+        """Remove all group-header linguette and re-insert at correct positions.
+        Called after a tab is reordered by drag-and-drop to keep headers aligned."""
+        # Remember the currently active view so we can restore it
+        current_view = self._tab_widget.currentWidget()
+
+        # Remove all existing header tabs AND any "+" pseudo-tab
+        # (both will be re-created below in the right order)
+        to_remove = [i for i in range(self._tab_bar.count())
+                     if (CalNavTabBar.is_header_data(self._tab_bar.tabData(i))
+                         or CalNavTabBar.is_plus_data(self._tab_bar.tabData(i)))]
+        for i in reversed(to_remove):
+            w = self._tab_widget.widget(i)
+            self._tab_widget.removeTab(i)
+            if w:
+                w.deleteLater()
+
+        # Re-insert a header before each group's first real tab (first-seen order)
+        seen: set = set()
+        for i in range(self._tab_bar.count()):
+            d = self._tab_bar.tabData(i)
+            if d and not CalNavTabBar.is_header_data(d) and not CalNavTabBar.is_plus_data(d) and d not in seen:
+                seen.add(d)
+                if self._get_group(d):
+                    self._ensure_group_header(d)
+
+        # Re-apply collapsed state on the freshly inserted headers
+        for gid in self._collapsed_groups:
+            g = self._get_group(gid)
+            if not g:
+                continue
+            hdr = CalNavTabBar.header_data(gid)
+            for i in range(self._tab_bar.count()):
+                d = self._tab_bar.tabData(i)
+                if d == gid:
+                    self._tab_bar.setTabVisible(i, False)
+                elif d == hdr:
+                    self._tab_widget.setTabText(i, f"▶ {g.name}")
+
+        # Restore active view
+        if isinstance(current_view, QWebEngineView):
+            idx = self._tab_widget.indexOf(current_view)
+            if idx >= 0 and self._tab_bar.isTabVisible(idx):
+                self._tab_widget.setCurrentIndex(idx)
+
+        # Always keep "+" pseudo-tab at the end
+        self._ensure_plus_tab()
+        self._tab_bar.update()
+
+    def _duplicate_tab(self, index: int):
+        view = self._tab_widget.widget(index)
+        if isinstance(view, QWebEngineView):
+            url = view.url().toString()
+            raw = self._tab_bar.tabData(index)
+            # Resolve placeholder data to the real group id (or None)
+            gid = CalNavTabBar.real_gid(raw) if raw else None
+            self._new_tab(url, group_id=gid)
+
+    # ── Session persistence ───────────────────────────────────────────────────
+    def _save_session(self):
+        tabs = []
+        for i in range(self._tab_widget.count()):
+            raw = self._tab_bar.tabData(i)
+            # Skip group-header linguetta tabs (virtual, not real pages)
+            if CalNavTabBar.is_header_data(raw):
+                continue
+            view = self._tab_widget.widget(i)
+            if not isinstance(view, QWebEngineView):
+                continue
+            url = view.url().toString()
+            if not url or url == "about:blank":
+                url = self._settings["homepage"]
+            title = self._tab_widget.tabText(i)
+            tabs.append(SavedTab(url=url, title=title, group_id=raw))
+        if not tabs:
+            return
+        # Stamp collapsed state onto groups before saving
+        for g in self._groups:
+            g.collapsed = (g.id in self._collapsed_groups)
+        # Determine active index among real (non-header) tabs
+        active_real = 0
+        real_counter = 0
+        for i in range(self._tab_widget.count()):
+            if CalNavTabBar.is_header_data(self._tab_bar.tabData(i)):
+                continue
+            if i == self._tab_widget.currentIndex():
+                active_real = real_counter
+                break
+            real_counter += 1
+        sm = SessionManager(self.profile_manager.current.session_file)
+        sm.save(self._groups, tabs, active_real)
+
+    def _restore_session(self):
+        sm = SessionManager(self.profile_manager.current.session_file)
+        active, groups, tabs = sm.load()
+        self._groups = groups
+        self._collapsed_groups = {g.id for g in groups if g.collapsed}
+        if tabs:
+            active_view = None
+            for i, t in enumerate(tabs):
+                view = self._new_tab(t.url, group_id=t.group_id, activate=False)
+                if i == active:
+                    active_view = view
+            # Re-collapse groups — this inserts placeholder tabs, shifting indices
+            self._apply_collapsed_groups()
+            # Locate the active view by object identity (immune to index shifts)
+            if active_view:
+                idx = self._tab_widget.indexOf(active_view)
+                if idx >= 0 and self._tab_bar.isTabVisible(idx):
+                    self._tab_widget.setCurrentIndex(idx)
+                    self._on_tab_changed(idx)
+                else:
+                    # Active tab was in a collapsed group — show first visible real tab
+                    for i in range(self._tab_widget.count()):
+                        if (self._tab_bar.isTabVisible(i)
+                                and isinstance(self._tab_widget.widget(i), QWebEngineView)):
+                            self._tab_widget.setCurrentIndex(i)
+                            self._on_tab_changed(i)
+                            break
+        else:
+            self._new_tab(self._settings["homepage"])
+
+    def closeEvent(self, event):
+        self._save_session()
+        event.accept()
 
     # ── UI ────────────────────────────────────────────────────────────────────
     def _build_ui(self):
@@ -1197,7 +2667,7 @@ class CalNavWindow(QMainWindow):
         self._save_bar.save_requested.connect(self._on_save_bar_saved)
         vbox.addWidget(self._save_bar)
 
-        vbox.addWidget(self._build_webview(), stretch=1)
+        vbox.addWidget(self._build_tab_widget(), stretch=1)
         self._build_status_bar()
         self.setStyleSheet(f"QMainWindow {{ background: {NAVY_DEEP}; }}")
 
@@ -1211,7 +2681,21 @@ class CalNavWindow(QMainWindow):
         h.setContentsMargins(14, 0, 14, 0)
         h.setSpacing(6)
 
-        brand = QLabel("\u2295 CalNav")
+        brand_icon = QLabel()
+        ico_path = Path(getattr(sys, "_MEIPASS", Path(__file__).parent)) / "logo_browser.ico"
+        if ico_path.exists():
+            # Pick the largest ICO frame then downscale smoothly to avoid graininess
+            brand_icon.setPixmap(
+                QIcon(str(ico_path)).pixmap(64, 64).scaled(
+                    32, 32,
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+            )
+        brand_icon.setStyleSheet("padding-right: 2px;")
+        h.addWidget(brand_icon)
+
+        brand = QLabel("CalNav")
         brand.setFont(QFont("Segoe UI", 13, QFont.Weight.Black))
         brand.setStyleSheet(
             f"color:{TEAL}; font-size:17px; font-weight:800; letter-spacing:3px; padding-right:6px;"
@@ -1267,6 +2751,18 @@ class CalNavWindow(QMainWindow):
         div2.setFixedSize(1, 28)
         div2.setStyleSheet("background:#1C3050;")
         h.addWidget(div2)
+
+        # Star button (bookmarks)
+        self.btn_star = NavButton("\u2606", "Aggiungi ai preferiti  Ctrl+D")
+        self.btn_star.setFont(QFont("Segoe UI", 18))
+        self.btn_star.clicked.connect(self._toggle_bookmark)
+        h.addWidget(self.btn_star)
+
+        # Bookmarks button
+        self.btn_bmarks = NavButton("\U0001f4d6", "Preferiti  Ctrl+Shift+B")
+        self.btn_bmarks.setFont(QFont("Segoe UI", 15))
+        self.btn_bmarks.clicked.connect(self._open_bookmarks)
+        h.addWidget(self.btn_bmarks)
 
         # Key button (password vault)
         self.btn_keys = NavButton("\U0001f511", "Password salvate  Ctrl+Shift+K")
@@ -1332,16 +2828,66 @@ class CalNavWindow(QMainWindow):
         self.progress_bar.hide()
         return self.progress_bar
 
-    def _build_webview(self) -> QWebEngineView:
-        self.webview = QWebEngineView()
-        self.webview.urlChanged.connect(self._on_url_changed)
-        self.webview.loadProgress.connect(self._on_load_progress)
-        self.webview.loadStarted.connect(self._on_load_started)
-        self.webview.loadFinished.connect(self._on_load_finished)
-        self.webview.titleChanged.connect(self._on_title_changed)
-        self.btn_back.clicked.connect(self.webview.back)
-        self.btn_forward.clicked.connect(self.webview.forward)
-        return self.webview
+    def _build_tab_widget(self) -> QTabWidget:
+        self._tab_bar = CalNavTabBar()
+        self._tab_bar.set_color_resolver(self._get_group_color)
+        self._tab_bar.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._tab_bar.customContextMenuRequested.connect(self._show_tab_context_menu)
+        # Linguetta clicks toggle collapse (no black flash — super() not called in bar)
+        self._tab_bar.group_header_clicked.connect(self._toggle_group_collapse)
+        # "+" child button
+        self._tab_bar.new_tab_requested.connect(
+            lambda: self._new_tab(self._settings["homepage"])
+        )
+        # Rebuild header positions after drag-and-drop reorder.
+        # Deferred so Qt finishes its own drag bookkeeping first;
+        # calling removeTab/insertTab mid-drag corrupts close-button state.
+        self._tab_bar.tabMoved.connect(
+            lambda _f, _t: QTimer.singleShot(0, self._rebuild_headers)
+        )
+
+        self._tab_widget = QTabWidget()
+        self._tab_widget.setTabBar(self._tab_bar)
+        self._tab_widget.setTabsClosable(False)   # close via × button or Ctrl+W
+        self._tab_widget.setMovable(True)
+        self._tab_widget.currentChanged.connect(self._on_tab_changed)
+
+        self._tab_widget.setStyleSheet(f"""
+            QTabWidget::pane {{
+                border: none;
+                background: {NAVY_DEEP};
+            }}
+            QTabBar {{
+                background: {NAVY_DEEP};
+            }}
+            QTabBar::tab {{
+                background: {NAVY_MID};
+                color: {TEXT_DIM};
+                border: none;
+                border-top-left-radius: 8px;
+                border-top-right-radius: 8px;
+                padding: 7px 24px 11px 14px;
+                margin-right: 2px;
+                min-width: 110px;
+                max-width: 220px;
+                font-size: 12px;
+            }}
+            QTabBar::tab:selected {{
+                background: {NAVY_LIGHT};
+                color: {TEXT_BRIGHT};
+                font-weight: bold;
+            }}
+            QTabBar::tab:hover:!selected {{
+                background: #182840;
+                color: {TEXT_BRIGHT};
+            }}
+        """)
+
+        # Wire back/forward via lambdas (lazy evaluation of self.webview)
+        self.btn_back.clicked.connect(lambda: self.webview.back()    if self.webview else None)
+        self.btn_forward.clicked.connect(lambda: self.webview.forward() if self.webview else None)
+
+        return self._tab_widget
 
     def _build_status_bar(self):
         sb = QStatusBar()
@@ -1388,16 +2934,22 @@ class CalNavWindow(QMainWindow):
             self._ie_badge.hide()
             self.statusBar().showMessage("Modalita moderna ripristinata — ricaricamento…", 3000)
 
-        self.webview.reload()
+        if self.webview:
+            self.webview.reload()
 
     # ── Navigazione ───────────────────────────────────────────────────────────
-    def load(self, url: str):
+    def _load_in_view(self, view: QWebEngineView, url: str):
+        """Navigate a specific view to url (smart URL / search fallback)."""
         if not url.startswith(("http://", "https://", "file://")):
             if "." in url and " " not in url:
                 url = "https://" + url
             else:
                 url = "https://www.google.com/search?q=" + url.replace(" ", "+")
-        self.webview.setUrl(QUrl(url))
+        view.setUrl(QUrl(url))
+
+    def load(self, url: str):
+        if self.webview:
+            self._load_in_view(self.webview, url)
 
     def _navigate_from_bar(self):
         t = self.address_bar.text().strip()
@@ -1405,39 +2957,56 @@ class CalNavWindow(QMainWindow):
             self.load(t)
 
     def _toggle_reload(self):
-        self.webview.reload()
+        if self.webview:
+            self.webview.reload()
 
     # ── WebView signals ───────────────────────────────────────────────────────
     def _on_url_changed(self, url: QUrl):
-        u = url.toString()
-        if u != "about:blank":
-            self.address_bar.setText(u)
-        h = self.webview.history()
-        self.btn_back.setEnabled(h.canGoBack())
-        self.btn_forward.setEnabled(h.canGoForward())
+        view = self.sender()
+        is_current = (view is self.webview)
 
-        # Update profile badge
-        prof = self.profile_manager.current
-        self._profile_badge.setText(f"  {prof.initial} {prof.display_name}  ")
-        self._profile_badge.setStyleSheet(f"""
-            color:{NAVY_DEEP}; background:{prof.color};
-            border-radius:4px; font-size:10px; font-weight:bold;
-            padding:1px 6px; margin:2px 4px;
-        """)
+        if is_current:
+            u = url.toString()
+            if u != "about:blank":
+                self.address_bar.setText(u)
+            h = view.history()
+            self.btn_back.setEnabled(h.canGoBack())
+            self.btn_forward.setEnabled(h.canGoForward())
+            self._update_star_button(u)
+
+            # Update profile badge
+            prof = self.profile_manager.current
+            self._profile_badge.setText(f"  {prof.initial} {prof.display_name}  ")
+            self._profile_badge.setStyleSheet(f"""
+                color:{NAVY_DEEP}; background:{prof.color};
+                border-radius:4px; font-size:10px; font-weight:bold;
+                padding:1px 6px; margin:2px 4px;
+            """)
 
     def _on_load_progress(self, pct: int):
-        self.progress_bar.setValue(pct)
+        if self.sender() is self.webview:
+            self.progress_bar.setValue(pct)
 
     def _on_load_started(self):
+        view = self.sender()
+        if view is not self.webview:
+            return
         self.progress_bar.show()
         self.progress_bar.setValue(0)
         self.btn_reload.setText("\u2715")
         self.btn_reload.setToolTip("Interrompi  Esc")
         self.btn_reload.clicked.disconnect()
-        self.btn_reload.clicked.connect(self.webview.stop)
+        self.btn_reload.clicked.connect(lambda: self.webview.stop() if self.webview else None)
         self.statusBar().showMessage("Caricamento…")
 
     def _on_load_finished(self, ok: bool):
+        view = self.sender()
+        # Always update tab close-button area
+        idx = self._tab_widget.indexOf(view)
+        if idx >= 0:
+            pass   # title will be updated via titleChanged
+        if view is not self.webview:
+            return
         self.progress_bar.setValue(100)
         self.progress_bar.hide()
         self.btn_reload.setText("\u21bb")
@@ -1447,9 +3016,17 @@ class CalNavWindow(QMainWindow):
         self.statusBar().showMessage("Pronto" if ok else "Errore nel caricamento", 5000)
 
     def _on_title_changed(self, title: str):
-        prof = self.profile_manager.current
-        suffix = f"  —  CalNav [{prof.display_name}]"
-        self.setWindowTitle(f"{title}{suffix}" if title else f"CalNav [{prof.display_name}]")
+        view = self.sender()
+        # Update tab label for every tab
+        idx = self._tab_widget.indexOf(view)
+        if idx >= 0:
+            self._tab_widget.setTabText(idx, (title[:28] + "…") if len(title) > 28 else title or "Nuova scheda")
+            self._tab_widget.setTabToolTip(idx, title)
+        # Update window title only for current tab
+        if view is self.webview:
+            prof = self.profile_manager.current
+            suffix = f"  —  CalNav [{prof.display_name}]"
+            self.setWindowTitle(f"{title}{suffix}" if title else f"CalNav [{prof.display_name}]")
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────

@@ -38,6 +38,14 @@ class Profile:
         return self.path / "passwords.enc"
 
     @property
+    def bookmarks_file(self) -> Path:
+        return self.path / "bookmarks.json"
+
+    @property
+    def session_file(self) -> Path:
+        return self.path / "session.json"
+
+    @property
     def initial(self) -> str:
         return (self.display_name or self.name)[0].upper()
 
