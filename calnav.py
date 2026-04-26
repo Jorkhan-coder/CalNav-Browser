@@ -1398,27 +1398,41 @@ class PasswordVaultDialog(QDialog):
             category=self._current_category,
         )
         self.table.setRowCount(len(entries))
+
         _ss_act = f"""
             QPushButton {{
                 background: rgba(0,212,255,0.12); color: {TEAL};
-                border: none; border-radius: 5px; padding: 0 7px; font-size: 12px;
+                border: none; border-radius: 5px;
+                font-size: 12px; font-weight: 500;
             }}
             QPushButton:hover {{ background: rgba(0,212,255,0.28); }}
         """
+        _ss_del = f"""
+            QPushButton {{
+                background: rgba(255,107,107,0.12); color: #FF6B6B;
+                border: none; border-radius: 5px;
+                font-size: 12px; font-weight: 500;
+            }}
+            QPushButton:hover {{ background: rgba(255,107,107,0.28); }}
+        """
+        # Fixed button sizes — explicit width prevents squishing
+        BW, BH = 68, 30   # normal action button
+        SW, SH = 58, 30   # shorter (Copia, Elimina)
+
         for r, e in enumerate(entries):
             self.table.setItem(r, 0, QTableWidgetItem(e.get("host", "")))
             self.table.setItem(r, 1, QTableWidgetItem(e.get("username", "")))
             self.table.setItem(r, 2, QTableWidgetItem("•" * 8))
             self.table.setItem(r, 3, QTableWidgetItem(e.get("category", "Generale")))
-            self.table.setRowHeight(r, 44)
+            self.table.setRowHeight(r, 50)
 
             cell = QWidget()
             cl = QHBoxLayout(cell)
-            cl.setContentsMargins(4, 4, 4, 4)
-            cl.setSpacing(4)
+            cl.setContentsMargins(6, 8, 6, 8)
+            cl.setSpacing(5)
 
-            btn_show = QPushButton("\U0001f441")
-            btn_show.setFixedHeight(28)
+            btn_show = QPushButton("Mostra")
+            btn_show.setFixedSize(BW, BH)
             btn_show.setCursor(Qt.CursorShape.PointingHandCursor)
             btn_show.setToolTip("Mostra / nascondi password")
             btn_show.setStyleSheet(_ss_act)
@@ -1426,40 +1440,38 @@ class PasswordVaultDialog(QDialog):
                 lambda _, row=r, pw=e["password"]: self._toggle_pw(row, pw))
             cl.addWidget(btn_show)
 
-            btn_copy = QPushButton("\U0001f4cb")
-            btn_copy.setFixedHeight(28)
+            btn_copy = QPushButton("Copia")
+            btn_copy.setFixedSize(SW, BH)
             btn_copy.setCursor(Qt.CursorShape.PointingHandCursor)
-            btn_copy.setToolTip("Copia password")
+            btn_copy.setToolTip("Copia password negli appunti")
             btn_copy.setStyleSheet(_ss_act)
             btn_copy.clicked.connect(
                 lambda _, pw=e["password"]: QApplication.clipboard().setText(pw))
             cl.addWidget(btn_copy)
 
-            btn_edit = QPushButton("✎")
-            btn_edit.setFixedHeight(28)
+            btn_edit = QPushButton("Modifica")
+            btn_edit.setFixedSize(BW, BH)
             btn_edit.setCursor(Qt.CursorShape.PointingHandCursor)
-            btn_edit.setToolTip("Modifica")
+            btn_edit.setToolTip("Modifica utente, password o categoria")
             btn_edit.setStyleSheet(_ss_act)
             btn_edit.clicked.connect(
                 lambda _, entry=dict(e): self._edit_entry(entry))
             cl.addWidget(btn_edit)
 
-            btn_del = QPushButton("✕")
-            btn_del.setFixedSize(28, 28)
+            btn_del = QPushButton("Elimina")
+            btn_del.setFixedSize(SW, BH)
             btn_del.setCursor(Qt.CursorShape.PointingHandCursor)
-            btn_del.setToolTip("Elimina")
-            btn_del.setStyleSheet(f"""
-                QPushButton {{
-                    background: rgba(255,107,107,0.12); color: #FF6B6B;
-                    border: none; border-radius: 5px; font-size: 12px;
-                }}
-                QPushButton:hover {{ background: rgba(255,107,107,0.28); }}
-            """)
+            btn_del.setToolTip("Elimina questa credenziale")
+            btn_del.setStyleSheet(_ss_del)
             btn_del.clicked.connect(
                 lambda _, h=e["host"], u=e["username"]: self._delete_entry(h, u))
             cl.addWidget(btn_del)
 
             self.table.setCellWidget(r, 4, cell)
+
+        # Force the Azioni column to fit the cell widgets exactly
+        self.table.horizontalHeader().setSectionResizeMode(
+            4, QHeaderView.ResizeMode.ResizeToContents)
 
     def _toggle_pw(self, row: int, password: str):
         item = self.table.item(row, 2)
