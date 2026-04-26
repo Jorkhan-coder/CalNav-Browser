@@ -27,7 +27,7 @@ from PyQt6.QtWebEngineCore import (
 from PyQt6.QtWebChannel import QWebChannel
 from PyQt6.QtCore import (
     QUrl, Qt, QObject, pyqtSlot, pyqtSignal, QFile, QIODevice,
-    PYQT_VERSION_STR, QT_VERSION_STR, QTimer, QRect, QSize,
+    PYQT_VERSION_STR, QT_VERSION_STR, QTimer, QRect, QSize, QProcess,
 )
 from PyQt6.QtGui import QFont, QIcon, QKeySequence, QShortcut, QPainter, QColor
 from PyQt6.QtNetwork import QNetworkAccessManager, QNetworkRequest
@@ -2716,66 +2716,118 @@ class CalNavMediaBar(QWidget):
 
 
 # ── Update notification bar ──────────────────────────────────────────────────
-class UpdateBar(QWidget):
-    """Notification bar shown when a newer CalNav version is available."""
+_GITHUB_PKG = "git+https://github.com/Jorkhan-coder/CalNav-Browser.git"
 
-    download_clicked = pyqtSignal()   # caller connects this to open the releases page
+class UpdateBar(QWidget):
+    """Notification bar: detects new version and auto-installs it via pip."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._process: QProcess | None = None
+        self._new_version = ""
         self._build()
         self.hide()
 
     def _build(self):
         self.setFixedHeight(40)
-        self.setStyleSheet(
-            f"background: #0A2A0A; border-bottom: 1px solid #51CF66;"
-        )
+        self.setStyleSheet("background: #0A2A0A; border-bottom: 1px solid #51CF66;")
         h = QHBoxLayout(self)
         h.setContentsMargins(18, 0, 18, 0)
         h.setSpacing(12)
 
-        icon = QLabel("[+]")
-        icon.setStyleSheet("color: #51CF66; font-size: 13px; font-weight: bold;")
-        h.addWidget(icon)
+        self._icon = QLabel("🟢")
+        self._icon.setStyleSheet("font-size: 12px;")
+        h.addWidget(self._icon)
 
         self._msg = QLabel()
         self._msg.setStyleSheet(f"color: {TEXT_BRIGHT}; font-size: 12px;")
         h.addWidget(self._msg, stretch=1)
 
-        btn_dl = QPushButton("Scarica")
-        btn_dl.setFixedSize(80, 28)
-        btn_dl.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn_dl.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
-        btn_dl.setStyleSheet("""
+        self._btn_update = QPushButton("Aggiorna")
+        self._btn_update.setFixedSize(90, 28)
+        self._btn_update.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._btn_update.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
+        self._btn_update.setStyleSheet("""
             QPushButton { background: #51CF66; color: #07111F; border: none; border-radius: 6px; }
             QPushButton:hover { background: #69DB7C; }
+            QPushButton:disabled { background: #2A4A2A; color: #4A8A4A; }
         """)
-        btn_dl.clicked.connect(self._on_download)
-        h.addWidget(btn_dl)
+        self._btn_update.clicked.connect(self._on_update)
+        h.addWidget(self._btn_update)
 
-        btn_x = QPushButton("X")
-        btn_x.setFixedSize(28, 28)
-        btn_x.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn_x.setStyleSheet(f"""
-            QPushButton {{ background: transparent; color: {TEXT_DIM}; border: none; font-size: 11px; border-radius: 5px; }}
+        self._btn_x = QPushButton("✕")
+        self._btn_x.setFixedSize(28, 28)
+        self._btn_x.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._btn_x.setStyleSheet(f"""
+            QPushButton {{ background: transparent; color: {TEXT_DIM}; border: none;
+                font-size: 11px; border-radius: 5px; }}
             QPushButton:hover {{ color: {TEXT_BRIGHT}; }}
         """)
-        btn_x.clicked.connect(self.hide)
-        h.addWidget(btn_x)
+        self._btn_x.clicked.connect(self.hide)
+        h.addWidget(self._btn_x)
 
     def retheme(self):
         self._msg.setStyleSheet(f"color: {TEXT_BRIGHT}; font-size: 12px;")
 
     def show_update(self, version: str):
-        self._msg.setText(
-            f"Disponibile CalNav {version}  —  stai usando la {__version__}"
-        )
+        self._new_version = version
+        self._set_idle(f"Disponibile CalNav {version}  —  stai usando la {__version__}")
         self.show()
 
-    def _on_download(self):
-        self.download_clicked.emit()
-        self.hide()
+    # ── States ────────────────────────────────────────────────────────────────
+
+    def _set_idle(self, text: str):
+        self._msg.setText(text)
+        self._btn_update.setEnabled(True)
+        self._btn_update.setText("Aggiorna")
+        self._btn_x.setVisible(True)
+
+    def _set_busy(self, text: str):
+        self._msg.setText(text)
+        self._btn_update.setEnabled(False)
+        self._btn_update.setText("…")
+        self._btn_x.setVisible(False)
+
+    def _set_done(self, text: str):
+        self._msg.setText(text)
+        self._btn_update.setEnabled(False)
+        self._btn_update.setText("✓")
+        self._btn_x.setVisible(False)
+
+    def _set_error(self, text: str):
+        self._msg.setText(text)
+        self._btn_update.setEnabled(True)
+        self._btn_update.setText("Riprova")
+        self._btn_x.setVisible(True)
+
+    # ── Auto-update logic ─────────────────────────────────────────────────────
+
+    def _on_update(self):
+        self._set_busy("⏳  Aggiornamento in corso, attendere…")
+        self._process = QProcess(self)
+        self._process.finished.connect(self._on_pip_done)
+        self._process.start(sys.executable,
+                            ["-m", "pip", "install", "--upgrade", _GITHUB_PKG])
+
+    def _on_pip_done(self, exit_code: int, _exit_status):
+        if exit_code == 0:
+            self._set_done("✅  Aggiornamento completato! Riavvio in corso…")
+            QTimer.singleShot(1800, self._restart)
+        else:
+            stderr = bytes(self._process.readAllStandardError()).decode(errors="replace")
+            brief = stderr.strip().splitlines()[-1] if stderr.strip() else "errore sconosciuto"
+            self._set_error(f"❌  Aggiornamento fallito: {brief[:80]}")
+
+    @staticmethod
+    def _restart():
+        """Relaunch CalNav and exit the current instance."""
+        import subprocess
+        argv0 = sys.argv[0]
+        # Entry-point launcher (calnav / calnav.exe) vs plain script
+        cmd = ([argv0] + sys.argv[1:] if not argv0.endswith(".py")
+               else [sys.executable, argv0] + sys.argv[1:])
+        subprocess.Popen(cmd)
+        QApplication.instance().quit()
 
 
 # ── Update checker ────────────────────────────────────────────────────────────
@@ -4416,10 +4468,6 @@ class CalNavWindow(QMainWindow):
         vbox.addWidget(self._build_progress_bar())
 
         self._update_bar = UpdateBar()
-        # "Scarica" button opens the GitHub releases page in the active tab
-        self._update_bar.download_clicked.connect(
-            lambda: self.load(GITHUB_RELEASES_URL)
-        )
         vbox.addWidget(self._update_bar)
 
         self._save_bar = SavePasswordBar()
