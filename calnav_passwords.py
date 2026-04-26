@@ -6,11 +6,21 @@ from pathlib import Path
 from typing import Dict, List, Optional
 from urllib.parse import urlparse
 
-try:
-    import winreg as _winreg
+def _machine_id() -> str:
+    """Return a stable per-machine identifier used as KDF input.
 
-    def _machine_id() -> str:
+    Windows  → HKLM\\SOFTWARE\\Microsoft\\Cryptography → MachineGuid
+    Linux    → /etc/machine-id  (systemd)  or  /var/lib/dbus/machine-id
+    macOS    → ioreg IOPlatformUUID
+    Fallback → static string (passwords are still encrypted, just not
+               machine-tied — acceptable for a single-user desktop app)
+    """
+    import sys as _sys
+
+    # ── Windows ──────────────────────────────────────────────────────────────
+    if _sys.platform == "win32":
         try:
+            import winreg as _winreg
             key = _winreg.OpenKey(
                 _winreg.HKEY_LOCAL_MACHINE,
                 r"SOFTWARE\Microsoft\Cryptography",
@@ -21,10 +31,34 @@ try:
             _winreg.CloseKey(key)
             return val
         except Exception:
-            return "calnav-fallback-machine-id"
-except ImportError:
-    def _machine_id() -> str:
-        return "calnav-fallback-machine-id"
+            pass
+
+    # ── Linux / BSD (systemd machine-id) ─────────────────────────────────────
+    for _mid_path in ("/etc/machine-id", "/var/lib/dbus/machine-id"):
+        try:
+            mid = open(_mid_path).read().strip()
+            if mid:
+                return mid
+        except OSError:
+            pass
+
+    # ── macOS (IOPlatformUUID) ────────────────────────────────────────────────
+    if _sys.platform == "darwin":
+        try:
+            import subprocess as _sp
+            out = _sp.check_output(
+                ["ioreg", "-rd1", "-c", "IOPlatformExpertDevice"],
+                stderr=_sp.DEVNULL,
+                text=True,
+            )
+            import re as _re
+            m = _re.search(r'"IOPlatformUUID"\s*=\s*"([^"]+)"', out)
+            if m:
+                return m.group(1)
+        except Exception:
+            pass
+
+    return "calnav-fallback-machine-id"
 
 try:
     import base64

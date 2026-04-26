@@ -4,6 +4,8 @@
 __version__ = "1.1.0-alpha"
 
 import json
+import os
+import re
 import sys
 from pathlib import Path
 
@@ -14,7 +16,7 @@ from PyQt6.QtWidgets import (
     QLineEdit, QPushButton, QStatusBar, QProgressBar, QLabel,
     QDialog, QDialogButtonBox, QTableWidget, QTableWidgetItem,
     QHeaderView, QScrollArea, QMessageBox,
-    QTabWidget, QTabBar, QMenu, QColorDialog, QInputDialog,
+    QTabWidget, QTabBar, QMenu, QColorDialog, QInputDialog, QSlider,
 )
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWebEngineCore import (
@@ -60,10 +62,13 @@ def _save_settings(s: dict):
         json.dumps(s, ensure_ascii=False, indent=2), encoding="utf-8"
     )
 
+# User-agent: byte-for-byte identical to Chrome 124 on Windows 10 x64.
+# Deliberately no "CalNav" token — Twitch, Netflix and other streaming CDNs
+# do exact-suffix checks like /Safari\/537\.36$/ and reject any extra tokens.
 CALNAV_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "CalNav/1.0 Chrome/120.0.0.0 Safari/537.36"
+    "Chrome/124.0.0.0 Safari/537.36"
 )
 
 IE_UA = "Mozilla/5.0 (Windows NT 10.0; Trident/7.0; rv:11.0) like Gecko"
@@ -157,6 +162,69 @@ IE_SHIMS_JS = """
 })();
 """
 
+# ── Chrome-compatibility shim (injected at DocumentCreation in every page) ────
+# QtWebEngine is built on Chromium but does NOT expose window.chrome — that
+# object is part of the Chrome browser layer, not the open-source Chromium
+# engine.  Twitch, Netflix and similar services check for window.chrome (or
+# specific sub-properties) to decide whether the browser is "compatible".
+# Without it they show error #4000 / codec-not-supported screens even though
+# the underlying Chromium is perfectly capable.
+CHROME_COMPAT_JS = """
+(function () {
+    'use strict';
+    if (window.chrome) return;
+    var chrome = {
+        app: {
+            isInstalled: false,
+            InstallState: {
+                DISABLED: 'disabled', INSTALLED: 'installed',
+                NOT_INSTALLED: 'not_installed'
+            },
+            RunningState: {
+                CANNOT_RUN: 'cannot_run', READY_TO_RUN: 'ready_to_run',
+                RUNNING: 'running'
+            },
+            getDetails:      function () { return null; },
+            getIsInstalled:  function () { return false; },
+            installState:    function (cb) { cb('not_installed'); }
+        },
+        csi: function () {
+            return { startE: Date.now(), onloadT: Date.now(), pageT: 0, tran: 15 };
+        },
+        loadTimes: function () {
+            var t = Date.now() / 1000;
+            return {
+                commitLoadTime: t, connectionInfo: 'h2',
+                finishDocumentLoadTime: t, finishLoadTime: t,
+                firstPaintAfterLoadTime: 0, firstPaintTime: t,
+                navigationType: 'Other', npnNegotiatedProtocol: 'h2',
+                requestTime: t - 0.05, startLoadTime: t - 0.05,
+                wasAlternateProtocolAvailable: false,
+                wasFetchedViaSpdy: true, wasNpnNegotiated: true
+            };
+        },
+        runtime: {
+            id: undefined,
+            connect:             function () { return { onMessage: { addListener: function(){} }, postMessage: function(){}, disconnect: function(){} }; },
+            sendMessage:         function () {},
+            onMessage:           { addListener: function(){}, removeListener: function(){} },
+            onConnect:           { addListener: function(){}, removeListener: function(){} },
+            onInstalled:         { addListener: function(){}, removeListener: function(){} },
+            OnInstalledReason:   { CHROME_UPDATE:'chrome_update', INSTALL:'install', SHARED_MODULE_UPDATE:'shared_module_update', UPDATE:'update' },
+            PlatformArch:        { X86_64:'x86-64', X86_32:'x86-32', ARM:'arm', MIPS:'mips', MIPS64:'mips64' },
+            PlatformOs:          { WIN:'win', MAC:'mac', LINUX:'linux', ANDROID:'android', CROS:'cros', OPENBSD:'openbsd' }
+        }
+    };
+    try {
+        Object.defineProperty(window, 'chrome', {
+            value: chrome, writable: false, enumerable: true, configurable: false
+        });
+    } catch (e) {
+        window.chrome = chrome;
+    }
+})();
+"""
+
 DETECT_FORMS_JS = """
 (function() {
     if (typeof QWebChannel === 'undefined' || typeof qt === 'undefined') return;
@@ -212,6 +280,159 @@ DETECT_FORMS_JS = """
         new MutationObserver(function() { scanForms(); })
             .observe(document.documentElement, { childList: true, subtree: true });
     });
+})();
+"""
+
+# ── Media detection & control JS (injected at DocumentReady in every page) ───
+MEDIA_JS = r"""
+(function() {
+  if (window.__cn_media_init) return;
+  window.__cn_media_init = true;
+
+  var bridge = null;
+  var lastReport = '';
+  var reportPending = false;
+
+  // Connect to the QWebChannel bridge (async – retried until ready)
+  function tryConnect() {
+    if (typeof QWebChannel === 'undefined' || typeof qt === 'undefined') {
+      setTimeout(tryConnect, 600); return;
+    }
+    new QWebChannel(qt.webChannelTransport, function(ch) {
+      bridge = ch.objects.calnav_bridge;
+      scheduleReport(0);
+    });
+  }
+  tryConnect();
+
+  // Find the "most relevant" media element: prefer playing, else first found
+  function getMedia() {
+    var all = [].slice.call(document.querySelectorAll('video, audio'));
+    return (
+      all.find(function(m){ return !m.paused && !m.ended && m.readyState >= 2; }) ||
+      all[0] || null
+    );
+  }
+
+  function scheduleReport(delay) {
+    if (reportPending) return;
+    reportPending = true;
+    setTimeout(function() { reportPending = false; doReport(); }, delay || 0);
+  }
+
+  // Returns true when the video is large enough to have its own visible player UI
+  // (YouTube, Vimeo, Netflix, etc.).  In that case CalNav should NOT show its
+  // own media bar, since it would be redundant.
+  function hasVisiblePlayerUI(m) {
+    if (!m || m.tagName !== 'VIDEO') return false;
+    var r = m.getBoundingClientRect();
+    return (
+      r.width  >= 160 &&
+      r.height >= 90  &&
+      r.bottom >  0   &&
+      r.top    <  window.innerHeight &&
+      r.right  >  0   &&
+      r.left   <  window.innerWidth
+    );
+  }
+
+  function doReport() {
+    if (!bridge) return;
+    // Hidden tabs stop reporting — Python keeps the last known state so the
+    // tab-bar dot remains lit even when you're on a different tab.
+    if (document.hidden) return;
+    var m = getMedia();
+    var s;
+    if (m && (m.currentSrc || m.src)) {
+      s = JSON.stringify({
+        hasMedia:      true,
+        isVideo:       m.tagName === 'VIDEO',
+        hasOwnPlayer:  hasVisiblePlayerUI(m),   // page already has a visible player
+        src:           m.currentSrc || m.src || '',
+        currentTime:   m.currentTime,
+        duration:      isFinite(m.duration) ? m.duration : 0,
+        paused:        m.paused,
+        volume:        m.volume,
+        muted:         m.muted,
+        title:         document.title || location.hostname || ''
+      });
+    } else {
+      s = '{"hasMedia":false}';
+    }
+    sendState(s);
+  }
+
+  function sendState(s) {
+    if (s === lastReport) return;
+    lastReport = s;
+    try { bridge.on_media_state(s); } catch(e) {}
+  }
+
+  // Wire a single media element to auto-report on events
+  function wire(el) {
+    if (el.__cn_m) return; el.__cn_m = true;
+    ['play','pause','ended','seeking','seeked',
+     'volumechange','loadedmetadata','durationchange','emptied'
+    ].forEach(function(e){ el.addEventListener(e, function(){ scheduleReport(80); }); });
+  }
+
+  function scan() { document.querySelectorAll('video,audio').forEach(wire); }
+
+  if (document.body) scan();
+  document.addEventListener('DOMContentLoaded', scan);
+  // Report when tab becomes visible (user switches back to this tab)
+  document.addEventListener('visibilitychange', function() {
+    if (!document.hidden) scheduleReport(150);
+    // When hidden: do NOT send — Python keeps last known state for the dot indicator
+  });
+  // Watch for dynamically inserted media (SPAs, YouTube, etc.)
+  new MutationObserver(scan)
+    .observe(document.documentElement, {childList: true, subtree: true});
+  // Periodic heartbeat so seek position stays in sync
+  setInterval(function(){ if (!document.hidden) doReport(); }, 2500);
+
+  // ── Commands called from Python via page.runJavaScript ───────────────────
+  // Exposed as window.__cn_* so Python can call them safely
+
+  window.__cn_report = function() { lastReport = ''; doReport(); };
+
+  window.__cn_play_pause = function() {
+    var m = getMedia() || document.querySelector('video, audio');
+    if (!m) return;
+    if (m.paused) { m.play(); } else { m.pause(); }
+  };
+
+  window.__cn_seek_to = function(t) {
+    var m = getMedia() || document.querySelector('video, audio');
+    if (m) m.currentTime = parseFloat(t);
+  };
+
+  window.__cn_seek_rel = function(d) {
+    var m = getMedia() || document.querySelector('video, audio');
+    if (m) m.currentTime = Math.max(0, m.currentTime + parseFloat(d));
+  };
+
+  window.__cn_volume = function(v) {
+    document.querySelectorAll('video,audio').forEach(function(m) {
+      m.volume  = Math.min(1, Math.max(0, parseFloat(v)));
+      m.muted   = (parseFloat(v) === 0);
+    });
+  };
+
+  // Picture-in-Picture — works when called in response to a user action
+  // (Python calls this from button/shortcut, which satisfies the gesture req)
+  window.__cn_pip = function() {
+    var v = [].slice.call(document.querySelectorAll('video'));
+    var target = v.find(function(x){ return !x.paused; }) || v[0];
+    if (!target) return;
+    if (document.pictureInPictureElement === target) {
+      document.exitPictureInPicture().catch(function(){});
+    } else {
+      target.requestPictureInPicture().catch(function(e){
+        console.warn('[CalNav PiP]', e.message);
+      });
+    }
+  };
 })();
 """
 
@@ -311,6 +532,9 @@ class AddressBar(QLineEdit):
 # ── QWebChannel bridge ────────────────────────────────────────────────────────
 class CalNavBridge(QObject):
     save_password_requested = pyqtSignal(str, str, str)
+    # Emitted every time the active tab's media state changes.
+    # Payload is a JSON string (see MEDIA_JS for schema).
+    media_state_changed = pyqtSignal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -318,6 +542,11 @@ class CalNavBridge(QObject):
     @pyqtSlot(str, str, str)
     def offer_save_password(self, url: str, username: str, password: str):
         self.save_password_requested.emit(url, username, password)
+
+    @pyqtSlot(str)
+    def on_media_state(self, state_json: str):
+        """Receives media state from MEDIA_JS running in any tab."""
+        self.media_state_changed.emit(state_json)
 
 
 # ── Save-password notification bar ───────────────────────────────────────────
@@ -1332,8 +1561,442 @@ class BookmarksDialog(QDialog):
             self._refresh_bookmarks()
 
 
+def _show_pip(pip: "CalNavPiPWindow") -> None:
+    """Show the PiP window (first time: bottom-right of screen) or raise it."""
+    if not pip.isVisible():
+        pip.show_centered_bottom_right()
+    else:
+        pip.raise_()
+        pip.activateWindow()
+
+
+# ── Floating always-on-top PiP window ────────────────────────────────────────
+class CalNavPiPWindow(QWidget):
+    """
+    A frameless, always-on-top, draggable mini-player window.
+    Lives completely outside the tab hierarchy — survives tab switches,
+    browser minimisation, and window focus changes.
+
+    Content strategy
+    ────────────────
+    • YouTube / YouTube Music  → uses the official /embed/ URL so cookies
+      (login, quality prefs) are shared via the same QWebEngineProfile.
+    • Any direct http/https URL that is not a blob:  → loaded in a plain
+      <video> element filling the mini window.
+    • blob: / MSE streams where we cannot get a transferable URL → the
+      native browser requestPictureInPicture() is tried as a last resort.
+    """
+
+    _W, _H = 400, 240          # default size
+    _TITLE_H = 26              # draggable title bar height
+
+    # Emitted when the user closes the PiP window — CalNavWindow uses this to
+    # un-mute the source tab that was silenced when PiP was opened.
+    pip_closed = pyqtSignal()
+
+    def __init__(self, profile: "QWebEngineProfile", parent=None):
+        super().__init__(
+            None,                           # no Qt parent → truly independent OS window
+            Qt.WindowType.Window
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.FramelessWindowHint,
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setMinimumSize(240, 160)
+        self.resize(self._W, self._H)
+        self._drag_pos = None
+        self._profile = profile
+        self._build()
+
+    def closeEvent(self, event):
+        super().closeEvent(event)
+        self.pip_closed.emit()
+
+    def _build(self):
+        self.setStyleSheet(f"""
+            CalNavPiPWindow {{
+                background: {NAVY_DEEP};
+                border: 1px solid {TEAL_DIM};
+                border-radius: 8px;
+            }}
+        """)
+        vbox = QVBoxLayout(self)
+        vbox.setContentsMargins(0, 0, 0, 0)
+        vbox.setSpacing(0)
+
+        # ── Title / drag bar ──────────────────────────────────────────────
+        bar = QWidget()
+        bar.setFixedHeight(self._TITLE_H)
+        bar.setStyleSheet(
+            f"background: {NAVY_MID}; border-radius: 8px 8px 0 0;"
+        )
+        bh = QHBoxLayout(bar)
+        bh.setContentsMargins(10, 0, 6, 0)
+        bh.setSpacing(6)
+
+        lbl_icon = QLabel("⧉")
+        lbl_icon.setStyleSheet(f"color: {TEAL}; font-size: 12px;")
+        bh.addWidget(lbl_icon)
+
+        self._lbl_title = QLabel("CalNav PiP")
+        self._lbl_title.setStyleSheet(
+            f"color: {TEXT_DIM}; font-size: 10px;"
+        )
+        bh.addWidget(self._lbl_title, stretch=1)
+
+        btn_close = QPushButton("×")
+        btn_close.setFixedSize(20, 20)
+        btn_close.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_close.setStyleSheet(f"""
+            QPushButton {{ background: transparent; color: {TEXT_DIM};
+                           border: none; font-size: 14px; }}
+            QPushButton:hover {{ color: #FF6B6B; }}
+        """)
+        btn_close.clicked.connect(self.close)
+        bh.addWidget(btn_close)
+        vbox.addWidget(bar)
+
+        # ── Video view ────────────────────────────────────────────────────
+        self._view = QWebEngineView()
+        page = QWebEnginePage(self._profile, self._view)
+        self._view.setPage(page)
+        self._view.setStyleSheet("background: black;")
+        vbox.addWidget(self._view, stretch=1)
+
+    # ── Dragging ──────────────────────────────────────────────────────────────
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_pos = (
+                event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+            )
+
+    def mouseMoveEvent(self, event):
+        if event.buttons() == Qt.MouseButton.LeftButton and self._drag_pos:
+            self.move(event.globalPosition().toPoint() - self._drag_pos)
+
+    def mouseReleaseEvent(self, event):
+        self._drag_pos = None
+
+    # ── Content loading ───────────────────────────────────────────────────────
+    def play_direct(self, src: str, current_time: float, title: str = ""):
+        """Load a raw video/audio URL in a plain <video> element."""
+        t = max(0.0, float(current_time))
+        html = f"""<!DOCTYPE html>
+<html><body style="margin:0;background:#000;overflow:hidden">
+<video id="v" src="{src}"
+       style="width:100%;height:100vh;object-fit:contain"
+       autoplay></video>
+<script>
+  var v = document.getElementById('v');
+  v.currentTime = {t:.3f};
+  v.play().catch(function(){{}});
+</script>
+</body></html>"""
+        self._view.setHtml(html, QUrl(src))
+        self._set_title(title)
+
+    def play_url(self, url: str, title: str = ""):
+        """Navigate to an arbitrary URL inside the mini view."""
+        self._view.load(QUrl(url))
+        self._set_title(title)
+
+    # JavaScript injected after the YouTube watch page loads.
+    # Hides header / sidebar / comments and fixes the player to fill the window.
+    _YT_PIP_JS = """
+(function() {
+    if (document.getElementById('__cn_pip_style')) return;
+    var s = document.createElement('style');
+    s.id = '__cn_pip_style';
+    s.textContent =
+        '#masthead-container, ytd-mini-guide-renderer, #guide, tp-yt-app-drawer,' +
+        'ytd-watch-metadata, ytd-video-primary-info-renderer,' +
+        'ytd-video-secondary-info-renderer, #secondary, #related, #above-the-fold,' +
+        '#comments, ytd-item-section-renderer, .ytd-watch-flexy[is-two-columns_],' +
+        '#chat-container, ytd-live-chat-frame' +
+        '{ display: none !important; }' +
+        'body, html { overflow: hidden !important; background: #000 !important; }' +
+        '#primary, #primary-inner { padding: 0 !important; margin: 0 !important; }' +
+        '#movie_player {' +
+        '  width: 100vw !important; height: 100vh !important;' +
+        '  position: fixed !important; top: 0 !important; left: 0 !important;' +
+        '  z-index: 9999 !important;' +
+        '}';
+    document.head.appendChild(s);
+})();
+"""
+
+    def play_youtube(self, video_id: str, start_time: float, title: str = ""):
+        """Load youtube.com/watch (not embed) and strip the page UI via CSS.
+
+        Using the full watch URL avoids embed error 153 entirely — the video
+        plays exactly as it does in the main browser tab.  The injected CSS
+        hides header / sidebar / comments and fixes the player to fill the
+        PiP window.
+        """
+        url = (
+            f"https://www.youtube.com/watch?v={video_id}"
+            f"&t={int(max(0, start_time))}s"
+        )
+        # Inject CSS after the SPA has rendered (loadFinished fires on the
+        # initial HTML load, before the SPA JS populates the DOM — wait 900 ms)
+        def _on_loaded(ok):
+            try:
+                self._view.loadFinished.disconnect(_on_loaded)
+            except Exception:
+                pass
+            QTimer.singleShot(900, lambda: self._view.page().runJavaScript(self._YT_PIP_JS))
+        self._view.loadFinished.connect(_on_loaded)
+        self._view.load(QUrl(url))
+        self._set_title(title or "YouTube PiP")
+
+    def _set_title(self, title: str):
+        t = title[:40] + "…" if len(title) > 40 else title
+        self._lbl_title.setText(t or "CalNav PiP")
+
+    def show_centered_bottom_right(self):
+        """First-time positioning: bottom-right of the primary screen."""
+        from PyQt6.QtWidgets import QApplication
+        screen = QApplication.primaryScreen().availableGeometry()
+        self.move(
+            screen.right()  - self.width()  - 24,
+            screen.bottom() - self.height() - 48,
+        )
+        self.show()
+        self.raise_()
+
+
+# ── Persistent media control bar ─────────────────────────────────────────────
+class CalNavMediaBar(QWidget):
+    """
+    A slim strip shown at the bottom of the browser whenever audio or video
+    is playing in the active tab.  Persists across tab switches (clears and
+    re-fills when the new tab reports its media state).
+
+    Unique features
+    ───────────────
+    • Play / Pause, ±10 s seek buttons and a draggable seek slider
+    • Volume wheel
+    • ⧉ PiP button — requests Picture-in-Picture via the Web API
+    • Small pulsing dot painted on the tab bar for tabs with active media
+      (implemented in CalNavTabBar._paint_group_overlays via a resolver)
+    """
+
+    play_pause_requested = pyqtSignal()
+    seek_requested       = pyqtSignal(float)   # absolute time in seconds
+    seek_rel_requested   = pyqtSignal(float)   # relative offset in seconds
+    volume_requested     = pyqtSignal(float)   # 0.0 – 1.0
+    pip_requested        = pyqtSignal()
+
+    _H = 48   # bar height in pixels
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedHeight(self._H)
+        self._state: dict = {}
+        self._seeking = False
+        self._build()
+        self.hide()
+
+    # ── UI construction ───────────────────────────────────────────────────────
+    def _build(self):
+        self.setStyleSheet(f"""
+            CalNavMediaBar {{
+                background: {NAVY_MID};
+                border-top: 2px solid {TEAL_DIM};
+            }}
+        """)
+        h = QHBoxLayout(self)
+        h.setContentsMargins(16, 0, 12, 0)
+        h.setSpacing(8)
+
+        # Type icon  (📺 / 🎵)
+        self._lbl_icon = QLabel("🎵")
+        self._lbl_icon.setFixedWidth(20)
+        self._lbl_icon.setStyleSheet("font-size: 15px;")
+        h.addWidget(self._lbl_icon)
+
+        # Title
+        self._lbl_title = QLabel("—")
+        self._lbl_title.setStyleSheet(
+            f"color: {TEXT_BRIGHT}; font-size: 11px;"
+        )
+        self._lbl_title.setMaximumWidth(200)
+        self._lbl_title.setTextFormat(Qt.TextFormat.PlainText)
+        h.addWidget(self._lbl_title)
+
+        h.addSpacing(4)
+
+        # ← −10 s
+        self._btn_rew = self._mk_btn("⏪", "−10 s")
+        self._btn_rew.clicked.connect(lambda: self.seek_rel_requested.emit(-10.0))
+        h.addWidget(self._btn_rew)
+
+        # ▶ / ⏸
+        self._btn_pp = self._mk_btn("▶", "Play / Pausa  (Ctrl+Shift+Space)", accent=True)
+        self._btn_pp.setFixedSize(36, 36)
+        self._btn_pp.clicked.connect(self.play_pause_requested)
+        h.addWidget(self._btn_pp)
+
+        # +10 s →
+        self._btn_fwd = self._mk_btn("⏩", "+10 s")
+        self._btn_fwd.clicked.connect(lambda: self.seek_rel_requested.emit(10.0))
+        h.addWidget(self._btn_fwd)
+
+        h.addSpacing(6)
+
+        # Seek bar
+        self._seek = QSlider(Qt.Orientation.Horizontal)
+        self._seek.setRange(0, 10000)
+        self._seek.setFixedHeight(18)
+        self._seek.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._seek.setStyleSheet(self._slider_css(TEAL, TEAL_DIM))
+        self._seek.sliderPressed.connect(lambda: setattr(self, '_seeking', True))
+        self._seek.sliderReleased.connect(self._on_seek_released)
+        h.addWidget(self._seek, stretch=1)
+
+        # Time label
+        self._lbl_time = QLabel("0:00 / 0:00")
+        self._lbl_time.setStyleSheet(
+            f"color: {TEXT_DIM}; font-size: 10px; min-width: 76px;"
+        )
+        h.addWidget(self._lbl_time)
+
+        h.addSpacing(4)
+
+        # 🔊 Volume slider
+        lbl_vol = QLabel("🔊")
+        lbl_vol.setStyleSheet("font-size: 13px;")
+        h.addWidget(lbl_vol)
+
+        self._vol = QSlider(Qt.Orientation.Horizontal)
+        self._vol.setRange(0, 100)
+        self._vol.setValue(100)
+        self._vol.setFixedSize(72, 18)
+        self._vol.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._vol.setStyleSheet(self._slider_css(TEAL_DIM, "#1A3A5C"))
+        self._vol.valueChanged.connect(
+            lambda v: self.volume_requested.emit(v / 100.0)
+        )
+        h.addWidget(self._vol)
+
+        h.addSpacing(6)
+
+        # ⧉ PiP
+        self._btn_pip = self._mk_btn("⧉ PiP", "Picture-in-Picture  Ctrl+Shift+V")
+        self._btn_pip.setFixedWidth(58)
+        self._btn_pip.clicked.connect(self.pip_requested)
+        h.addWidget(self._btn_pip)
+
+        # × close
+        btn_x = QPushButton("×")
+        btn_x.setFixedSize(22, 22)
+        btn_x.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_x.setStyleSheet(f"""
+            QPushButton {{ background: transparent; color: {TEXT_DIM};
+                           border: none; font-size: 15px; }}
+            QPushButton:hover {{ color: {TEXT_BRIGHT}; }}
+        """)
+        btn_x.clicked.connect(self.hide)
+        h.addWidget(btn_x)
+
+    @staticmethod
+    def _mk_btn(text: str, tip: str = "", accent: bool = False) -> QPushButton:
+        bg = TEAL if accent else NAVY_LIGHT
+        fg = NAVY_DEEP if accent else TEXT_BRIGHT
+        hv = "#33DDFF" if accent else "#253852"
+        b = QPushButton(text)
+        b.setFixedSize(30, 30)
+        b.setCursor(Qt.CursorShape.PointingHandCursor)
+        if tip:
+            b.setToolTip(tip)
+        b.setStyleSheet(f"""
+            QPushButton {{
+                background: {bg}; color: {fg};
+                border: none; border-radius: 6px; font-size: 12px;
+            }}
+            QPushButton:hover {{ background: {hv}; }}
+        """)
+        return b
+
+    @staticmethod
+    def _slider_css(fill: str, track: str) -> str:
+        return f"""
+            QSlider::groove:horizontal {{
+                background: {track}; height: 4px; border-radius: 2px;
+            }}
+            QSlider::sub-page:horizontal {{
+                background: {fill}; height: 4px; border-radius: 2px;
+            }}
+            QSlider::handle:horizontal {{
+                background: white; width: 10px; height: 10px;
+                margin: -3px 0; border-radius: 5px;
+            }}
+        """
+
+    # ── State update ─────────────────────────────────────────────────────────
+    def update_state(self, state: dict):
+        """Called whenever the active tab reports a new media state."""
+        self._state = state
+
+        if not state.get("hasMedia"):
+            self.hide()
+            return
+
+        if not self.isVisible():
+            self.show()
+
+        paused   = state.get("paused", True)
+        is_video = state.get("isVideo", False)
+        title    = state.get("title", "")
+        current  = float(state.get("currentTime", 0))
+        duration = float(state.get("duration", 0))
+        volume   = float(state.get("volume", 1))
+        muted    = bool(state.get("muted", False))
+
+        self._lbl_icon.setText("📺" if is_video else "🎵")
+
+        # Truncate title
+        max_chars = 36
+        if len(title) > max_chars:
+            title = title[: max_chars - 1] + "…"
+        self._lbl_title.setText(title)
+
+        self._btn_pp.setText("⏸" if not paused else "▶")
+
+        # Update seek without triggering seek_requested signal
+        if not self._seeking and duration > 0:
+            self._seek.blockSignals(True)
+            self._seek.setValue(int((current / duration) * 10000))
+            self._seek.blockSignals(False)
+
+        def _fmt(s: float) -> str:
+            s = int(s)
+            return f"{s // 60}:{s % 60:02d}"
+
+        self._lbl_time.setText(f"{_fmt(current)} / {_fmt(duration)}")
+
+        # Volume
+        self._vol.blockSignals(True)
+        self._vol.setValue(0 if muted else int(volume * 100))
+        self._vol.blockSignals(False)
+
+        # PiP button visible only for video
+        self._btn_pip.setVisible(is_video)
+
+    def _on_seek_released(self):
+        self._seeking = False
+        duration = float(self._state.get("duration", 0))
+        if duration > 0:
+            t = (self._seek.value() / 10000.0) * duration
+            self.seek_requested.emit(t)
+
+
 # ── Update notification bar ──────────────────────────────────────────────────
 class UpdateBar(QWidget):
+    """Notification bar shown when a newer CalNav version is available."""
+
+    download_clicked = pyqtSignal()   # caller connects this to open the releases page
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self._build()
@@ -1378,16 +2041,13 @@ class UpdateBar(QWidget):
         h.addWidget(btn_x)
 
     def show_update(self, version: str):
-        self._version = version
         self._msg.setText(
             f"Disponibile CalNav {version}  —  stai usando la {__version__}"
         )
         self.show()
 
     def _on_download(self):
-        parent = self.parent()
-        if parent and hasattr(parent, "load"):
-            parent.load(GITHUB_RELEASES_URL)
+        self.download_clicked.emit()
         self.hide()
 
 
@@ -1422,10 +2082,21 @@ class UpdateChecker(QObject):
 
     @staticmethod
     def _is_newer(remote: str, current: str) -> bool:
+        """Return True if *remote* version is strictly greater than *current*.
+
+        Handles pre-release suffixes (e.g. "1.1.0-alpha", "1.2.0-rc1") by
+        stripping everything after the first non-numeric character in each
+        dotted component before comparing.
+        """
+        import re
+        def parse(v: str):
+            nums = []
+            for part in v.strip().split("."):
+                m = re.match(r"(\d+)", part)
+                nums.append(int(m.group(1)) if m else 0)
+            return tuple(nums)
         try:
-            r = tuple(int(x) for x in remote.split("."))
-            c = tuple(int(x) for x in current.split("."))
-            return r > c
+            return parse(remote) > parse(current)
         except Exception:
             return False
 
@@ -1592,6 +2263,9 @@ class CalNavTabBar(QTabBar):
     group_header_clicked = pyqtSignal(str)
     # Emits when "+" pseudo-tab is clicked
     new_tab_requested = pyqtSignal()
+    # Emits after a drag-and-drop reorder is FULLY COMPLETE (mouse released).
+    # Safe moment to call removeTab/insertTab without corrupting Qt's drag state.
+    tabs_reordered = pyqtSignal()
 
     # tabData prefix for group-header "linguetta" tabs
     _HEADER_PREFIX = "__hdr__"
@@ -1601,12 +2275,24 @@ class CalNavTabBar(QTabBar):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._color_resolver = lambda gid: None   # group_id → str color | None
+        self._media_resolver  = lambda idx: False  # tab index → bool (media playing)
+        self._drag_in_progress = False             # True while user holds mouse during drag
+        # Track whether any tab moved during the current drag gesture
+        self.tabMoved.connect(self._on_tab_moved_internal)
         self.setDrawBase(False)
         self.setElideMode(Qt.TextElideMode.ElideRight)
         self.setExpanding(False)
 
     def set_color_resolver(self, fn):
         self._color_resolver = fn
+
+    def set_media_resolver(self, fn):
+        """fn(index: int) -> bool  — returns True if that tab has active media."""
+        self._media_resolver = fn
+
+    def _on_tab_moved_internal(self, _from: int, _to: int):
+        """Record that a drag-reorder happened; actual rebuild waits for mouseRelease."""
+        self._drag_in_progress = True
 
     # ── data helpers ─────────────────────────────────────────────────────────
     @classmethod
@@ -1641,7 +2327,16 @@ class CalNavTabBar(QTabBar):
             return QSize(36, super().minimumTabSizeHint(index).height())
         return super().minimumTabSizeHint(index)
 
-    # ── mouse: intercept special tabs so Qt never "selects" them ─────────────
+    # ── mouse ─────────────────────────────────────────────────────────────────
+    def mouseReleaseEvent(self, event):
+        """After a drag-and-drop reorder, emit tabs_reordered so the caller can
+        rebuild header positions safely — AFTER Qt has fully committed the drag."""
+        super().mouseReleaseEvent(event)
+        if self._drag_in_progress:
+            self._drag_in_progress = False
+            # Defer one more tick so Qt finishes any post-release internal cleanup
+            QTimer.singleShot(0, self.tabs_reordered.emit)
+
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
             idx = self.tabAt(event.pos())
@@ -1670,6 +2365,22 @@ class CalNavTabBar(QTabBar):
     def _paint_group_overlays(self, painter: QPainter):
         for idx in range(self.count()):
             raw = self.tabData(idx)
+
+            # ── Tiny "▶" media-playing dot in the top-right of real tabs ──
+            # NOTE: raw is None for un-grouped tabs — is_header_data/is_plus_data
+            # both return False for None, so the raw-guard is intentionally absent.
+            if (not self.is_header_data(raw) and not self.is_plus_data(raw)
+                    and self._media_resolver(idx)):
+                rect = self.tabRect(idx)
+                dot_r = 5
+                cx = rect.right() - dot_r - 4
+                cy = rect.top()   + dot_r + 4
+                painter.save()
+                painter.setBrush(QColor(TEAL))
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.drawEllipse(cx - dot_r, cy - dot_r, dot_r * 2, dot_r * 2)
+                painter.restore()
+
             if not raw:
                 continue
 
@@ -1820,6 +2531,10 @@ class CalNavWindow(QMainWindow):
         self.profile_manager = ProfileManager()
         self._groups: List[TabGroup] = []        # active tab groups
         self._collapsed_groups: set = set()      # group_ids currently collapsed
+        # Media state: maps QWebEngineView → latest reported state dict
+        self._media_states: dict = {}            # view -> {hasMedia, paused, ...}
+        self._pip_window: Optional["CalNavPiPWindow"] = None  # floating mini-player
+        self._pip_source_view: Optional[QWebEngineView] = None  # tab muted when PiP opened
 
         self._build_ui()   # builds tab widget + toolbar (no tabs yet)
 
@@ -1830,8 +2545,12 @@ class CalNavWindow(QMainWindow):
         # Shared bridge + channel (all tabs share the same bridge)
         self._bridge = CalNavBridge(self)
         self._bridge.save_password_requested.connect(self._on_save_request)
+        self._bridge.media_state_changed.connect(self._on_media_state)
         self._channel = QWebChannel(self)
         self._channel.registerObject("calnav_bridge", self._bridge)
+
+        # Wire the tab-bar media resolver (shows dot on tabs with active media)
+        self._tab_bar.set_media_resolver(self._tab_index_has_media)
 
         # Named web profile (shared by all tabs)
         self._web_profile = QWebEngineProfile(prof.name, self)
@@ -1853,9 +2572,27 @@ class CalNavWindow(QMainWindow):
         return w if isinstance(w, QWebEngineView) else None
 
     # ── Profile / password helpers ────────────────────────────────────────────
+    @staticmethod
+    def _build_chrome_ua() -> str:
+        """Return a UA string identical to real Chrome for the actual Chromium
+        version bundled with this Qt build.
+
+        QtWebEngine's default UA looks like:
+          Mozilla/5.0 (...) AppleWebKit/537.36 (KHTML, like Gecko)
+          QtWebEngine/6.8.1 Chrome/124.0.6367.208 Safari/537.36
+
+        We keep everything except the 'QtWebEngine/X.X.X' token.  This means
+        the Chrome version number is always accurate — sites that do JS
+        feature-detection (Twitch, Netflix) won't see mismatches.
+        """
+        raw = QWebEngineProfile.defaultProfile().httpUserAgent()
+        # Strip the QtWebEngine/x.x.x token (with surrounding spaces)
+        ua = re.sub(r"\s*QtWebEngine/[\d.]+\s*", " ", raw).strip()
+        return ua
+
     def _apply_profile_settings(self):
         p = self._web_profile
-        p.setHttpUserAgent(IE_UA if self._ie_mode else CALNAV_UA)
+        p.setHttpUserAgent(IE_UA if self._ie_mode else self._build_chrome_ua())
 
         s = p.settings()
         s.setAttribute(QWebEngineSettings.WebAttribute.JavascriptEnabled, True)
@@ -1863,6 +2600,12 @@ class CalNavWindow(QMainWindow):
         s.setAttribute(QWebEngineSettings.WebAttribute.WebGLEnabled, True)
         s.setAttribute(QWebEngineSettings.WebAttribute.ScrollAnimatorEnabled, True)
         s.setAttribute(QWebEngineSettings.WebAttribute.PluginsEnabled, True)
+        # ── Media: allow autoplay + full codec/MSE support ───────────────────
+        s.setAttribute(QWebEngineSettings.WebAttribute.PlaybackRequiresUserGesture, False)
+        s.setAttribute(QWebEngineSettings.WebAttribute.ScreenCaptureEnabled, True)
+        # NOTE: WebRTCPublicInterfacesOnly is intentionally NOT set — setting it
+        # to True blocks Twitch's low-latency WebRTC streams.
+        # ─────────────────────────────────────────────────────────────────────
         s.setAttribute(
             QWebEngineSettings.WebAttribute.JavascriptCanOpenWindows, self._ie_mode
         )
@@ -1875,9 +2618,18 @@ class CalNavWindow(QMainWindow):
         )
 
         scripts = p.scripts()
-        for name in ("calnav_ie_shims", "calnav_qwebchannel", "calnav_forms"):
+        for name in ("calnav_ie_shims", "calnav_qwebchannel", "calnav_forms",
+                     "calnav_media", "calnav_chrome_compat"):
             for old in scripts.find(name):
                 scripts.remove(old)
+
+        # ── window.chrome shim — must run before any page JS (DocumentCreation)
+        chrome_script = QWebEngineScript()
+        chrome_script.setName("calnav_chrome_compat")
+        chrome_script.setSourceCode(CHROME_COMPAT_JS)
+        chrome_script.setInjectionPoint(QWebEngineScript.InjectionPoint.DocumentCreation)
+        chrome_script.setWorldId(QWebEngineScript.ScriptWorldId.MainWorld)
+        scripts.insert(chrome_script)
 
         qwc_js = _load_qwebchannel_js()
         if qwc_js:
@@ -1896,6 +2648,14 @@ class CalNavWindow(QMainWindow):
         form_script.setInjectionPoint(QWebEngineScript.InjectionPoint.DocumentReady)
         form_script.setWorldId(QWebEngineScript.ScriptWorldId.MainWorld)
         scripts.insert(form_script)
+
+        # ── Media detection & control script ─────────────────────────────────
+        media_script = QWebEngineScript()
+        media_script.setName("calnav_media")
+        media_script.setSourceCode(MEDIA_JS)
+        media_script.setInjectionPoint(QWebEngineScript.InjectionPoint.DocumentReady)
+        media_script.setWorldId(QWebEngineScript.ScriptWorldId.MainWorld)
+        scripts.insert(media_script)
 
         if self._ie_mode:
             shim = QWebEngineScript()
@@ -2021,6 +2781,9 @@ class CalNavWindow(QMainWindow):
         QShortcut(QKeySequence("Ctrl+W"),         self, lambda: self._close_tab(self._tab_widget.currentIndex()))
         QShortcut(QKeySequence("Ctrl+Tab"),       self, self._next_tab)
         QShortcut(QKeySequence("Ctrl+Shift+Tab"), self, self._prev_tab)
+        # Media shortcuts
+        QShortcut(QKeySequence("Ctrl+Shift+V"),   self, self._media_pip)
+        QShortcut(QKeySequence("Ctrl+Shift+Space"), self, self._media_play_pause)
 
     def _focus_address_bar(self):
         self.address_bar.setFocus()
@@ -2031,6 +2794,142 @@ class CalNavWindow(QMainWindow):
             self.webview.page().triggerAction(
                 self.webview.page().WebAction.InspectElement
             )
+
+    # ── Media system ──────────────────────────────────────────────────────────
+    def _on_media_state(self, state_json: str):
+        """Receive media state update from MEDIA_JS running in the active tab."""
+        try:
+            state = json.loads(state_json)
+        except Exception:
+            state = {}
+        # Associate state with the currently active view (for tab dot)
+        view = self.webview
+        if view is not None:
+            self._media_states[view] = state
+        # Show the media bar ONLY when the page has no visible player of its own.
+        # Examples where we DO show it: audio streams, podcasts, background music,
+        # videos with no controls attribute and small/off-screen rect.
+        # Examples where we DON'T: YouTube, Vimeo, Spotify, any page with a
+        # full-size embedded video player.
+        if state.get("hasOwnPlayer"):
+            self._media_bar.update_state({})   # hide bar — page has its own UI
+        else:
+            self._media_bar.update_state(state)
+        # Refresh tab-bar dots (playing indicator)
+        self._tab_bar.update()
+
+    def _tab_index_has_media(self, index: int) -> bool:
+        """Return True if the tab at *index* has non-paused media playing."""
+        view = self._tab_widget.widget(index)
+        if not isinstance(view, QWebEngineView):
+            return False
+        state = self._media_states.get(view, {})
+        return bool(state.get("hasMedia") and not state.get("paused"))
+
+    def _media_js(self, js: str):
+        """Run a JS snippet on the currently active tab's page."""
+        view = self.webview
+        if view:
+            view.page().runJavaScript(js)
+
+    def _media_play_pause(self):
+        self._media_js("if(window.__cn_play_pause) window.__cn_play_pause();")
+
+    def _media_seek(self, t: float):
+        self._media_js(f"if(window.__cn_seek_to) window.__cn_seek_to({t:.3f});")
+
+    def _media_seek_rel(self, delta: float):
+        self._media_js(f"if(window.__cn_seek_rel) window.__cn_seek_rel({delta:.1f});")
+
+    def _media_volume(self, v: float):
+        self._media_js(f"if(window.__cn_volume) window.__cn_volume({v:.3f});")
+
+    def _ensure_pip_window(self) -> "CalNavPiPWindow":
+        """Return the shared PiP window, creating it on first call."""
+        if self._pip_window is None:
+            self._pip_window = CalNavPiPWindow(self._web_profile, parent=None)
+            self._pip_window.pip_closed.connect(self._on_pip_closed)
+        return self._pip_window
+
+    def _on_pip_closed(self):
+        """Un-mute the source tab that was silenced when PiP was opened."""
+        if self._pip_source_view is not None:
+            try:
+                self._pip_source_view.page().setAudioMuted(False)
+            except RuntimeError:
+                pass  # view was already deleted
+            self._pip_source_view = None
+
+    def _media_pip(self):
+        """Open Picture-in-Picture for the active tab's video.
+
+        Strategy
+        ────────
+        1. Qt 6.8+ TogglePictureInPicture WebAction — promotes the EXISTING
+           <video> element into the OS PiP overlay.  No new page load, no ads,
+           perfectly in sync with the original tab.  Works for YouTube, Twitch,
+           and any other site with a <video> element.
+        2. JS requestPictureInPicture() — same idea via the Web API.  Requires
+           --disable-features=UserActivationV2 so runJavaScript() counts as a
+           trusted user gesture.
+        3. CalNavPiPWindow fallback — only for direct http/https video URLs
+           (non-blob) where neither native approach succeeded.  blob: / MSE /
+           DRM streams cannot be transferred to another renderer and are skipped.
+        """
+        view = self.webview
+        if not view:
+            return
+
+        title = view.title() or ""
+
+        # ── 1. Native Qt WebAction (Qt 6.8+, trusted context) ────────────────
+        # triggerPageAction runs in a trusted renderer context, satisfying the
+        # user-gesture requirement without any Chromium flag gymnastics.
+        pip_action = getattr(QWebEnginePage.WebAction, "TogglePictureInPicture", None)
+        if pip_action is not None:
+            try:
+                view.page().triggerPageAction(pip_action)
+                return
+            except Exception:
+                pass
+
+        # ── 2. JS requestPictureInPicture() ──────────────────────────────────
+        # Works when --disable-features=UserActivationV2 is set (see main()).
+        _PIP_JS = (
+            "(function(){"
+            "var v=document.querySelector('video');"
+            "if(v&&document.pictureInPictureEnabled){"
+            "  v.requestPictureInPicture().catch(function(){});"
+            "  return true;"
+            "}"
+            "return false;"
+            "})()"
+        )
+
+        def _after_js_pip(ok):
+            if ok:
+                return  # JS PiP accepted — done
+
+            # ── 3. CalNavPiPWindow for direct transferable URLs ───────────────
+            state = self._media_states.get(view, {})
+            src = state.get("src", "")
+            if not src or src.startswith("blob:"):
+                return  # blob: / MSE cannot be transferred
+
+            def _open_direct(t):
+                pip = self._ensure_pip_window()
+                pip.play_direct(src, t or 0, title)
+                _show_pip(pip)
+
+            view.page().runJavaScript(
+                "(function(){"
+                "var v=document.querySelector('video,audio');"
+                "return v?v.currentTime:0;"
+                "})()",
+                _open_direct,
+            )
+
+        view.page().runJavaScript(_PIP_JS, _after_js_pip)
 
     def _next_tab(self):
         n = self._tab_widget.count()
@@ -2210,6 +3109,7 @@ class CalNavWindow(QMainWindow):
             except Exception:
                 pass
             view.setPage(QWebEnginePage())   # detach shared profile page
+            self._media_states.pop(view, None)   # clean up media state
         if view:
             view.deleteLater()
         # Remove group header if no more real tabs belong to that group
@@ -2273,6 +3173,16 @@ class CalNavWindow(QMainWindow):
         suffix = f"  —  CalNav [{prof.display_name}]"
         self.setWindowTitle(f"{title}{suffix}" if title else f"CalNav [{prof.display_name}]")
 
+        # ── Media bar: show cached state for this tab, then ask it to re-report
+        cached = self._media_states.get(view, {})
+        self._media_bar.update_state(cached)
+        # Request an immediate fresh report from the newly-active tab's JS
+        # (the MEDIA_JS visibilitychange handler fires too, but this ensures
+        #  the bar updates even on first switch when the JS is already loaded)
+        QTimer.singleShot(200, lambda: view.page().runJavaScript(
+            "if(window.__cn_report) window.__cn_report();"
+        ))
+
     # ── Group management ──────────────────────────────────────────────────────
     def _get_group_color(self, group_id: str) -> Optional[str]:
         for g in self._groups:
@@ -2296,6 +3206,10 @@ class CalNavWindow(QMainWindow):
             QMenu::item:selected {{ background: rgba(0,212,255,0.15); color: {TEAL}; }}
             QMenu::separator {{ height: 1px; background: #253852; margin: 4px 8px; }}
         """)
+
+        if index >= 0 and CalNavTabBar.is_plus_data(self._tab_bar.tabData(index)):
+            # Right-clicked on the "+" pseudo-tab — treat same as empty area
+            index = -1
 
         if index >= 0:
             raw_data = self._tab_bar.tabData(index)
@@ -2585,8 +3499,8 @@ class CalNavWindow(QMainWindow):
         tabs = []
         for i in range(self._tab_widget.count()):
             raw = self._tab_bar.tabData(i)
-            # Skip group-header linguetta tabs (virtual, not real pages)
-            if CalNavTabBar.is_header_data(raw):
+            # Skip group-header linguetta tabs and "+" pseudo-tab (virtual)
+            if CalNavTabBar.is_header_data(raw) or CalNavTabBar.is_plus_data(raw):
                 continue
             view = self._tab_widget.widget(i)
             if not isinstance(view, QWebEngineView):
@@ -2601,11 +3515,14 @@ class CalNavWindow(QMainWindow):
         # Stamp collapsed state onto groups before saving
         for g in self._groups:
             g.collapsed = (g.id in self._collapsed_groups)
-        # Determine active index among real (non-header) tabs
+        # Determine active index among real (non-header, non-plus) tabs
         active_real = 0
         real_counter = 0
         for i in range(self._tab_widget.count()):
-            if CalNavTabBar.is_header_data(self._tab_bar.tabData(i)):
+            raw = self._tab_bar.tabData(i)
+            if CalNavTabBar.is_header_data(raw) or CalNavTabBar.is_plus_data(raw):
+                continue
+            if not isinstance(self._tab_widget.widget(i), QWebEngineView):
                 continue
             if i == self._tab_widget.currentIndex():
                 active_real = real_counter
@@ -2627,6 +3544,8 @@ class CalNavWindow(QMainWindow):
                     active_view = view
             # Re-collapse groups — this inserts placeholder tabs, shifting indices
             self._apply_collapsed_groups()
+            # Ensure "+" pseudo-tab is at the end after all structural changes
+            self._ensure_plus_tab()
             # Locate the active view by object identity (immune to index shifts)
             if active_view:
                 idx = self._tab_widget.indexOf(active_view)
@@ -2636,8 +3555,10 @@ class CalNavWindow(QMainWindow):
                 else:
                     # Active tab was in a collapsed group — show first visible real tab
                     for i in range(self._tab_widget.count()):
+                        d = self._tab_bar.tabData(i)
                         if (self._tab_bar.isTabVisible(i)
-                                and isinstance(self._tab_widget.widget(i), QWebEngineView)):
+                                and isinstance(self._tab_widget.widget(i), QWebEngineView)
+                                and not CalNavTabBar.is_plus_data(d)):
                             self._tab_widget.setCurrentIndex(i)
                             self._on_tab_changed(i)
                             break
@@ -2661,6 +3582,10 @@ class CalNavWindow(QMainWindow):
         vbox.addWidget(self._build_progress_bar())
 
         self._update_bar = UpdateBar()
+        # "Scarica" button opens the GitHub releases page in the active tab
+        self._update_bar.download_clicked.connect(
+            lambda: self.load(GITHUB_RELEASES_URL)
+        )
         vbox.addWidget(self._update_bar)
 
         self._save_bar = SavePasswordBar()
@@ -2668,6 +3593,16 @@ class CalNavWindow(QMainWindow):
         vbox.addWidget(self._save_bar)
 
         vbox.addWidget(self._build_tab_widget(), stretch=1)
+
+        # ── Persistent media control bar ─────────────────────────────────────
+        self._media_bar = CalNavMediaBar()
+        self._media_bar.play_pause_requested.connect(self._media_play_pause)
+        self._media_bar.seek_requested.connect(self._media_seek)
+        self._media_bar.seek_rel_requested.connect(self._media_seek_rel)
+        self._media_bar.volume_requested.connect(self._media_volume)
+        self._media_bar.pip_requested.connect(self._media_pip)
+        vbox.addWidget(self._media_bar)
+
         self._build_status_bar()
         self.setStyleSheet(f"QMainWindow {{ background: {NAVY_DEEP}; }}")
 
@@ -2835,16 +3770,14 @@ class CalNavWindow(QMainWindow):
         self._tab_bar.customContextMenuRequested.connect(self._show_tab_context_menu)
         # Linguetta clicks toggle collapse (no black flash — super() not called in bar)
         self._tab_bar.group_header_clicked.connect(self._toggle_group_collapse)
-        # "+" child button
+        # "+" pseudo-tab emits this signal when clicked (see _ensure_plus_tab)
         self._tab_bar.new_tab_requested.connect(
             lambda: self._new_tab(self._settings["homepage"])
         )
         # Rebuild header positions after drag-and-drop reorder.
-        # Deferred so Qt finishes its own drag bookkeeping first;
-        # calling removeTab/insertTab mid-drag corrupts close-button state.
-        self._tab_bar.tabMoved.connect(
-            lambda _f, _t: QTimer.singleShot(0, self._rebuild_headers)
-        )
+        # tabs_reordered fires in mouseReleaseEvent (not tabMoved), so Qt's
+        # internal drag state is fully committed before we call removeTab/insertTab.
+        self._tab_bar.tabs_reordered.connect(self._rebuild_headers)
 
         self._tab_widget = QTabWidget()
         self._tab_widget.setTabBar(self._tab_bar)
@@ -2882,6 +3815,10 @@ class CalNavWindow(QMainWindow):
                 color: {TEXT_BRIGHT};
             }}
         """)
+        # Allow the "+" pseudo-tab to be narrower than the normal min-width.
+        # tabSizeHint() returns 36 px for it; without this override the stylesheet
+        # min-width: 110px would prevent that small size from being honoured.
+        self._tab_bar.setStyleSheet("QTabBar::tab { min-width: 0px; max-width: 220px; }")
 
         # Wire back/forward via lambdas (lazy evaluation of self.webview)
         self.btn_back.clicked.connect(lambda: self.webview.back()    if self.webview else None)
@@ -3040,6 +3977,42 @@ def _app_icon() -> QIcon:
 
 
 def main():
+    # ── Chromium flags (must be set BEFORE QApplication is created) ──────────
+    _existing = os.environ.get("QTWEBENGINE_CHROMIUM_FLAGS", "")
+
+    # The UA we want every page to see in navigator.userAgent.
+    # QWebEngineProfile.setHttpUserAgent() updates the HTTP header but in some
+    # Qt versions it does NOT update navigator.userAgent in JavaScript.
+    # Streaming sites (Twitch, Netflix…) read navigator.userAgent via JS, so
+    # they would still see the QtWebEngine UA and refuse to play.
+    # --user-agent set at engine startup guarantees BOTH the HTTP header AND
+    # navigator.userAgent report the same Chrome-compatible string.
+    _chrome_ua = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    )
+
+    _flags = (
+        # Engine-level UA override — ensures navigator.userAgent matches in JS
+        f'--user-agent="{_chrome_ua}" '
+        # Allow media to autoplay without a user-gesture requirement
+        "--autoplay-policy=no-user-gesture-required "
+        # Force software H.264/AAC decode via bundled FFmpeg.
+        # On Windows N (no Media Feature Pack) or when GPU H.264 decode is
+        # blocked, Chromium silently fails the hardware path and reports
+        # "codec not supported".  This flag bypasses that path entirely.
+        "--disable-accelerated-video-decode "
+        # Allow requestPictureInPicture() called from runJavaScript() to be
+        # treated as a trusted user gesture.  Without this flag the Web API
+        # rejects PiP requests that didn't originate from a real click/keypress.
+        "--disable-features=UserActivationV2"
+    )
+    if "--autoplay-policy=no-user-gesture-required" not in _existing:
+        os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = (
+            f"{_existing} {_flags}".strip()
+        )
+
     app = QApplication(sys.argv)
     app.setApplicationName("CalNav")
     app.setApplicationDisplayName("CalNav Browser")

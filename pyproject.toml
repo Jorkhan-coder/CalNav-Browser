@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "calnav-browser"
+version = "1.1.0a0"
+description = "CalNav — a custom browser built with PyQt6 and QtWebEngine"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+keywords = ["browser", "pyqt6", "qtwebengine"]
+
+dependencies = [
+    "PyQt6>=6.4.0",
+    "PyQt6-WebEngine>=6.4.0",
+    "cryptography>=41.0.0",
+]
+
+[project.scripts]
+calnav = "calnav:main"
+
+[tool.setuptools]
+# All source files live in the project root (no src/ layout)
+py-modules = [
+    "calnav",
+    "calnav_bookmarks",
+    "calnav_passwords",
+    "calnav_profiles",
+    "calnav_session",
+]
+
+[project.optional-dependencies]
+# Build a standalone executable (Windows only)
+build = ["pyinstaller>=6.0", "Pillow>=10.0"]

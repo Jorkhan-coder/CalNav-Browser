@@ -1,0 +1,24 @@
+# CalNav Browser — runtime dependencies
+#
+# Install with:
+#   pip install -r requirements.txt
+#
+# On Arch / CachyOS the Qt packages are better installed via pacman:
+#   sudo pacman -S python-pyqt6 python-pyqt6-webengine python-cryptography
+#
+# On Debian / Ubuntu:
+#   sudo apt install python3-pyqt6 python3-pyqt6.qtwebengine python3-cryptography
+#
+# On Fedora:
+#   sudo dnf install python3-qt6 python3-qt6-webengine python3-cryptography
+
+# Qt6 UI framework
+PyQt6>=6.4.0
+
+# QtWebEngine (Chromium-based renderer)
+# NOTE: on Linux this is often a separate system package (see above).
+# Install via pip only if your distro does not provide it.
+PyQt6-WebEngine>=6.4.0
+
+# Password encryption (optional — app runs without it, passwords are disabled)
+cryptography>=41.0.0
