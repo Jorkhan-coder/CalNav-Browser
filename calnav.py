@@ -17,6 +17,8 @@ from PyQt6.QtWidgets import (
     QDialog, QDialogButtonBox, QTableWidget, QTableWidgetItem,
     QHeaderView, QScrollArea, QMessageBox,
     QTabWidget, QTabBar, QMenu, QColorDialog, QInputDialog, QSlider,
+    QSplitter, QListWidget, QListWidgetItem, QCheckBox, QComboBox,
+    QSpinBox, QFormLayout,
 )
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWebEngineCore import (
@@ -881,129 +883,711 @@ class ProfileDialog(QDialog):
             self._refresh_list()
 
 
+# ── Password generator dialog ─────────────────────────────────────────────────
+class PasswordGeneratorDialog(QDialog):
+    """Floating dialog to create a random secure password."""
+
+    password_accepted = pyqtSignal(str)
+
+    _BTN_GHOST = f"""
+        QPushButton {{
+            background: rgba(0,212,255,0.15); color: {TEAL};
+            border: none; border-radius: 6px; padding: 0 14px;
+            font-size: 12px; font-weight: bold;
+        }}
+        QPushButton:hover {{ background: rgba(0,212,255,0.28); }}
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Genera Password — CalNav")
+        self.setFixedSize(420, 310)
+        self.setStyleSheet(f"background: {NAVY_MID}; color: {TEXT_BRIGHT};")
+        self._build()
+        self._generate()
+
+    def _build(self):
+        vbox = QVBoxLayout(self)
+        vbox.setContentsMargins(24, 20, 24, 18)
+        vbox.setSpacing(14)
+
+        hdr = QLabel("Genera Password")
+        hdr.setFont(QFont("Segoe UI", 13, QFont.Weight.Bold))
+        hdr.setStyleSheet(f"color: {TEAL};")
+        vbox.addWidget(hdr)
+
+        res_row = QHBoxLayout()
+        self._result = QLineEdit()
+        self._result.setReadOnly(True)
+        self._result.setFixedHeight(36)
+        self._result.setStyleSheet(f"""
+            QLineEdit {{
+                background: {NAVY_DEEP}; color: {TEXT_BRIGHT};
+                border: 1px solid #1C3050; border-radius: 7px;
+                padding: 0 10px; font-size: 13px; font-family: Consolas, monospace;
+            }}
+        """)
+        res_row.addWidget(self._result, stretch=1)
+        btn_refresh = QPushButton("⟳")
+        btn_refresh.setFixedSize(36, 36)
+        btn_refresh.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_refresh.setToolTip("Genera nuova")
+        btn_refresh.setStyleSheet(self._BTN_GHOST)
+        btn_refresh.clicked.connect(self._generate)
+        res_row.addWidget(btn_refresh)
+        vbox.addLayout(res_row)
+
+        len_row = QHBoxLayout()
+        len_row.addWidget(QLabel("Lunghezza:"))
+        self._len_spin = QSpinBox()
+        self._len_spin.setRange(8, 64)
+        self._len_spin.setValue(16)
+        self._len_spin.setFixedWidth(62)
+        self._len_spin.setStyleSheet(f"""
+            QSpinBox {{
+                background: {NAVY_DEEP}; color: {TEXT_BRIGHT};
+                border: 1px solid #1C3050; border-radius: 5px; padding: 2px 6px;
+            }}
+        """)
+        self._len_spin.valueChanged.connect(self._generate)
+        len_row.addWidget(self._len_spin)
+        self._len_slider = QSlider(Qt.Orientation.Horizontal)
+        self._len_slider.setRange(8, 64)
+        self._len_slider.setValue(16)
+        self._len_slider.valueChanged.connect(self._len_spin.setValue)
+        self._len_spin.valueChanged.connect(self._len_slider.setValue)
+        len_row.addWidget(self._len_slider, stretch=1)
+        vbox.addLayout(len_row)
+
+        opt_row = QHBoxLayout()
+        self._cb_upper   = QCheckBox("Maiuscole")
+        self._cb_digits  = QCheckBox("Cifre")
+        self._cb_symbols = QCheckBox("Simboli")
+        for cb in (self._cb_upper, self._cb_digits, self._cb_symbols):
+            cb.setChecked(True)
+            cb.setStyleSheet(f"color: {TEXT_BRIGHT}; spacing: 6px;")
+            cb.stateChanged.connect(self._generate)
+            opt_row.addWidget(cb)
+        opt_row.addStretch()
+        vbox.addLayout(opt_row)
+
+        self._strength_label = QLabel("")
+        self._strength_label.setStyleSheet("font-size: 11px;")
+        vbox.addWidget(self._strength_label)
+        vbox.addStretch()
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        btn_copy = QPushButton("Copia")
+        btn_copy.setFixedHeight(34)
+        btn_copy.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_copy.setStyleSheet(self._BTN_GHOST)
+        btn_copy.clicked.connect(self._copy)
+        btn_row.addWidget(btn_copy)
+        btn_use = QPushButton("Usa")
+        btn_use.setFixedHeight(34)
+        btn_use.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_use.setStyleSheet(f"""
+            QPushButton {{ background: {TEAL}; color: {NAVY_DEEP};
+                border: none; border-radius: 6px; padding: 0 18px; font-weight: bold; }}
+            QPushButton:hover {{ background: #33DDFF; }}
+        """)
+        btn_use.clicked.connect(self._use)
+        btn_row.addWidget(btn_use)
+        btn_cancel = QPushButton("Annulla")
+        btn_cancel.setFixedHeight(34)
+        btn_cancel.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_cancel.setStyleSheet(self._BTN_GHOST)
+        btn_cancel.clicked.connect(self.reject)
+        btn_row.addWidget(btn_cancel)
+        vbox.addLayout(btn_row)
+
+    def _generate(self):
+        from calnav_passwords import PasswordManager as _PM
+        pw = _PM.generate_password(
+            length=self._len_spin.value(),
+            uppercase=self._cb_upper.isChecked(),
+            digits=self._cb_digits.isChecked(),
+            symbols=self._cb_symbols.isChecked(),
+        )
+        self._result.setText(pw)
+        score = sum([
+            len(pw) >= 12, len(pw) >= 16,
+            any(c.isupper() for c in pw),
+            any(c.isdigit() for c in pw),
+            any(not c.isalnum() for c in pw),
+        ])
+        labels = ["", "Molto debole", "Debole", "Discreta", "Forte", "Molto forte"]
+        colors = ["", "#FF6B6B", "#FF922B", "#FFD43B", "#51CF66", "#00D4FF"]
+        idx = min(score, 5)
+        self._strength_label.setText(f"Forza: {labels[idx]}")
+        self._strength_label.setStyleSheet(f"font-size: 11px; color: {colors[idx]};")
+
+    def _copy(self):
+        QApplication.clipboard().setText(self._result.text())
+
+    def _use(self):
+        self.password_accepted.emit(self._result.text())
+        self.accept()
+
+    def current_password(self) -> str:
+        return self._result.text()
+
+
+# ── Edit password entry dialog ────────────────────────────────────────────────
+class EditPasswordEntryDialog(QDialog):
+    """Edit username, password and category of a saved credential."""
+
+    def __init__(self, entry: dict, categories: list, pm, parent=None):
+        super().__init__(parent)
+        self._entry = entry
+        self._pm = pm
+        self._all_cats = categories
+        self.setWindowTitle("Modifica credenziale — CalNav")
+        self.setFixedSize(400, 280)
+        self.setStyleSheet(f"background: {NAVY_MID}; color: {TEXT_BRIGHT};")
+        self._build()
+
+    def _build(self):
+        vbox = QVBoxLayout(self)
+        vbox.setContentsMargins(24, 20, 24, 18)
+        vbox.setSpacing(10)
+
+        hdr = QLabel(f"  {self._entry.get('host', '')}")
+        hdr.setFont(QFont("Segoe UI", 12, QFont.Weight.Bold))
+        hdr.setStyleSheet(f"color: {TEAL};")
+        vbox.addWidget(hdr)
+
+        _field_ss = f"""
+            QLineEdit, QComboBox {{
+                background: {NAVY_DEEP}; color: {TEXT_BRIGHT};
+                border: 1px solid #1C3050; border-radius: 6px; padding: 4px 8px;
+            }}
+        """
+        form = QFormLayout()
+        form.setSpacing(8)
+
+        self._usr = QLineEdit(self._entry.get("username", ""))
+        self._usr.setStyleSheet(_field_ss)
+        form.addRow("Utente:", self._usr)
+
+        self._pw = QLineEdit(self._entry.get("password", ""))
+        self._pw.setEchoMode(QLineEdit.EchoMode.Password)
+        self._pw.setStyleSheet(_field_ss)
+
+        _btn_ss = f"""
+            QPushButton {{ background: rgba(0,212,255,0.12); color: {TEAL};
+                border: none; border-radius: 5px; font-size: 13px; }}
+            QPushButton:checked {{ background: rgba(0,212,255,0.28); }}
+            QPushButton:hover {{ background: rgba(0,212,255,0.22); }}
+        """
+        pw_row = QHBoxLayout()
+        pw_row.setSpacing(4)
+        pw_row.addWidget(self._pw)
+        btn_eye = QPushButton("\U0001f441")
+        btn_eye.setFixedSize(30, 30)
+        btn_eye.setCheckable(True)
+        btn_eye.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_eye.setStyleSheet(_btn_ss)
+        btn_eye.toggled.connect(lambda on: self._pw.setEchoMode(
+            QLineEdit.EchoMode.Normal if on else QLineEdit.EchoMode.Password))
+        pw_row.addWidget(btn_eye)
+        btn_gen = QPushButton("\U0001f3b2")
+        btn_gen.setFixedSize(30, 30)
+        btn_gen.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_gen.setToolTip("Genera password")
+        btn_gen.setStyleSheet(_btn_ss)
+        btn_gen.clicked.connect(self._open_generator)
+        pw_row.addWidget(btn_gen)
+        pw_w = QWidget()
+        pw_w.setLayout(pw_row)
+        form.addRow("Password:", pw_w)
+
+        self._cat_combo = QComboBox()
+        self._cat_combo.setEditable(True)
+        self._cat_combo.setStyleSheet(_field_ss)
+        for c in self._all_cats:
+            self._cat_combo.addItem(c)
+        cur = self._entry.get("category", "Generale")
+        idx = self._cat_combo.findText(cur)
+        if idx >= 0:
+            self._cat_combo.setCurrentIndex(idx)
+        else:
+            self._cat_combo.setCurrentText(cur)
+        form.addRow("Categoria:", self._cat_combo)
+
+        vbox.addLayout(form)
+        vbox.addStretch()
+
+        bot = QHBoxLayout()
+        bot.addStretch()
+        btn_save = QPushButton("Salva")
+        btn_save.setFixedHeight(34)
+        btn_save.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_save.setStyleSheet(f"""
+            QPushButton {{ background: {TEAL}; color: {NAVY_DEEP};
+                border: none; border-radius: 6px; padding: 0 20px; font-weight: bold; }}
+            QPushButton:hover {{ background: #33DDFF; }}
+        """)
+        btn_save.clicked.connect(self._save)
+        bot.addWidget(btn_save)
+        btn_cancel = QPushButton("Annulla")
+        btn_cancel.setFixedHeight(34)
+        btn_cancel.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_cancel.setStyleSheet(f"""
+            QPushButton {{ background: rgba(0,212,255,0.15); color: {TEAL};
+                border: none; border-radius: 6px; padding: 0 16px; }}
+            QPushButton:hover {{ background: rgba(0,212,255,0.28); }}
+        """)
+        btn_cancel.clicked.connect(self.reject)
+        bot.addWidget(btn_cancel)
+        vbox.addLayout(bot)
+
+    def _open_generator(self):
+        dlg = PasswordGeneratorDialog(self)
+        dlg.password_accepted.connect(self._pw.setText)
+        dlg.exec()
+
+    def _save(self):
+        new_usr = self._usr.text().strip()
+        new_pw  = self._pw.text()
+        new_cat = self._cat_combo.currentText().strip() or "Generale"
+        if not new_usr:
+            return
+        self._pm.update_entry(
+            self._entry["host"], self._entry["username"],
+            new_username=new_usr,
+            new_password=new_pw if new_pw else None,
+            new_category=new_cat,
+        )
+        self.accept()
+
+
 # ── Password vault dialog ─────────────────────────────────────────────────────
 class PasswordVaultDialog(QDialog):
-    def __init__(self, password_manager: PasswordManager, parent=None):
+    """Full vault: category sidebar, search bar, table, generator shortcut."""
+
+    _TABLE_SS = f"""
+        QTableWidget {{
+            background: {NAVY_DEEP}; gridline-color: #1C3050;
+            color: {TEXT_BRIGHT}; border: 1px solid #1C3050; border-radius: 8px;
+        }}
+        QHeaderView::section {{
+            background: {NAVY_MID}; color: {TEAL};
+            border: none; padding: 6px; font-weight: bold;
+        }}
+        QTableWidget::item {{ padding: 4px 8px; }}
+        QTableWidget::item:selected {{ background: rgba(0,212,255,0.15); }}
+    """
+    _BTN_TEAL = f"""
+        QPushButton {{ background: {TEAL}; color: {NAVY_DEEP};
+            border: none; border-radius: 7px; padding: 0 22px; font-weight: bold; }}
+        QPushButton:hover {{ background: #33DDFF; }}
+    """
+    _BTN_GHOST = f"""
+        QPushButton {{ background: rgba(0,212,255,0.12); color: {TEAL};
+            border: none; border-radius: 7px; padding: 0 14px; font-size: 12px; }}
+        QPushButton:hover {{ background: rgba(0,212,255,0.26); }}
+    """
+
+    def __init__(self, password_manager, parent=None):
         super().__init__(parent)
         self.pm = password_manager
         self.setWindowTitle("Password Salvate — CalNav")
-        self.resize(660, 460)
+        self.resize(820, 520)
+        self._current_category: str = "Tutte"
         self._build()
 
     def _build(self):
         self.setStyleSheet(f"background: {NAVY_MID}; color: {TEXT_BRIGHT};")
-        vbox = QVBoxLayout(self)
-        vbox.setContentsMargins(20, 20, 20, 16)
-        vbox.setSpacing(12)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(18, 16, 18, 14)
+        root.setSpacing(10)
 
+        hdr_row = QHBoxLayout()
         hdr = QLabel("Password Salvate")
         hdr.setFont(QFont("Segoe UI", 14, QFont.Weight.Bold))
-        hdr.setStyleSheet(f"color: {TEAL}; margin-bottom: 4px;")
-        vbox.addWidget(hdr)
+        hdr.setStyleSheet(f"color: {TEAL};")
+        hdr_row.addWidget(hdr)
+        hdr_row.addStretch()
+        self._search = QLineEdit()
+        self._search.setPlaceholderText("\U0001f50d  Cerca sito, utente o categoria…")
+        self._search.setFixedHeight(32)
+        self._search.setFixedWidth(280)
+        self._search.setStyleSheet(f"""
+            QLineEdit {{
+                background: {NAVY_DEEP}; color: {TEXT_BRIGHT};
+                border: 1px solid #1C3050; border-radius: 7px; padding: 0 10px;
+            }}
+        """)
+        self._search.textChanged.connect(self._refresh_table)
+        hdr_row.addWidget(self._search)
+        root.addLayout(hdr_row)
 
         if not self.pm.available:
             warn = QLabel(
-                "Il modulo 'cryptography' non e' installato.\n"
-                "Esegui: pip install cryptography"
+                "Il modulo 'cryptography' non è installato.\n"
+                "Esegui:  pip install cryptography"
             )
-            warn.setStyleSheet(f"color: #FF6B6B; padding: 20px; font-size: 13px;")
-            vbox.addWidget(warn)
-        else:
-            self.table = QTableWidget()
-            self.table.setColumnCount(4)
-            self.table.setHorizontalHeaderLabels(["Sito", "Utente", "Password", "Azioni"])
-            hh = self.table.horizontalHeader()
-            hh.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-            hh.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-            hh.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-            hh.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-            self.table.setStyleSheet(f"""
-                QTableWidget {{
-                    background: {NAVY_DEEP}; gridline-color: #1C3050;
-                    color: {TEXT_BRIGHT}; border: 1px solid #1C3050; border-radius: 8px;
-                }}
-                QHeaderView::section {{
-                    background: {NAVY_MID}; color: {TEAL};
-                    border: none; padding: 6px; font-weight: bold;
-                }}
-                QTableWidget::item {{ padding: 4px 8px; }}
-                QTableWidget::item:selected {{ background: rgba(0,212,255,0.15); }}
-            """)
-            self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-            self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-            self.table.verticalHeader().setVisible(False)
-            vbox.addWidget(self.table, stretch=1)
-            self._fill_table()
+            warn.setStyleSheet("color: #FF6B6B; padding: 20px; font-size: 13px;")
+            root.addWidget(warn)
+            root.addStretch()
+            self._add_close_btn(root)
+            return
 
-        bottom = QHBoxLayout()
-        bottom.addStretch()
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setStyleSheet("QSplitter::handle { background: #1C3050; width: 1px; }")
+
+        left = QWidget()
+        left.setFixedWidth(170)
+        left.setStyleSheet(f"background: {NAVY_DEEP}; border-radius: 8px;")
+        lv = QVBoxLayout(left)
+        lv.setContentsMargins(0, 8, 0, 0)
+        lv.setSpacing(0)
+
+        cat_hdr = QLabel("  Categorie")
+        cat_hdr.setStyleSheet(
+            f"color: {TEAL}; font-weight: bold; font-size: 11px; padding: 4px 0 6px 0;")
+        lv.addWidget(cat_hdr)
+
+        self._cat_list = QListWidget()
+        self._cat_list.setStyleSheet(f"""
+            QListWidget {{
+                background: transparent; border: none;
+                color: {TEXT_BRIGHT}; font-size: 12px;
+            }}
+            QListWidget::item {{ padding: 7px 12px; border-radius: 5px; }}
+            QListWidget::item:selected {{ background: rgba(0,212,255,0.18); color: {TEAL}; }}
+            QListWidget::item:hover:!selected {{ background: rgba(255,255,255,0.05); }}
+        """)
+        self._cat_list.currentItemChanged.connect(self._on_category_selected)
+        self._cat_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._cat_list.customContextMenuRequested.connect(self._cat_context_menu)
+        lv.addWidget(self._cat_list, stretch=1)
+
+        btn_new_cat = QPushButton("＋  Nuova categoria")
+        btn_new_cat.setFixedHeight(30)
+        btn_new_cat.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_new_cat.setStyleSheet(f"""
+            QPushButton {{
+                background: rgba(0,212,255,0.10); color: {TEAL};
+                border: none; border-radius: 0 0 8px 8px;
+                font-size: 11px; padding: 0 12px;
+            }}
+            QPushButton:hover {{ background: rgba(0,212,255,0.22); }}
+        """)
+        btn_new_cat.clicked.connect(self._new_category)
+        lv.addWidget(btn_new_cat)
+        splitter.addWidget(left)
+
+        self.table = QTableWidget()
+        self.table.setColumnCount(5)
+        self.table.setHorizontalHeaderLabels(
+            ["Sito", "Utente", "Password", "Categoria", "Azioni"])
+        hh = self.table.horizontalHeader()
+        hh.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        hh.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        hh.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        self.table.setStyleSheet(self._TABLE_SS)
+        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.table.verticalHeader().setVisible(False)
+        splitter.addWidget(self.table)
+        splitter.setStretchFactor(1, 1)
+        root.addWidget(splitter, stretch=1)
+
+        bot = QHBoxLayout()
+        btn_gen = QPushButton("\U0001f3b2  Genera password")
+        btn_gen.setFixedHeight(36)
+        btn_gen.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_gen.setStyleSheet(self._BTN_GHOST)
+        btn_gen.clicked.connect(self._open_generator)
+        bot.addWidget(btn_gen)
+        bot.addStretch()
         btn_close = QPushButton("Chiudi")
         btn_close.setFixedHeight(36)
         btn_close.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn_close.setStyleSheet(f"""
-            QPushButton {{ background: {TEAL}; color: {NAVY_DEEP}; border: none; border-radius: 8px; padding: 0 24px; font-weight: bold; }}
-            QPushButton:hover {{ background: #33DDFF; }}
-        """)
+        btn_close.setStyleSheet(self._BTN_TEAL)
         btn_close.clicked.connect(self.accept)
-        bottom.addWidget(btn_close)
-        vbox.addLayout(bottom)
+        bot.addWidget(btn_close)
+        root.addLayout(bot)
 
-    def _fill_table(self):
-        entries = self.pm.all_entries()
+        self._rebuild_categories()
+        self._refresh_table()
+
+    def _add_close_btn(self, layout):
+        bot = QHBoxLayout()
+        bot.addStretch()
+        btn = QPushButton("Chiudi")
+        btn.setFixedHeight(36)
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.setStyleSheet(self._BTN_TEAL)
+        btn.clicked.connect(self.accept)
+        bot.addWidget(btn)
+        layout.addLayout(bot)
+
+    def _rebuild_categories(self):
+        self._cat_list.blockSignals(True)
+        self._cat_list.clear()
+        all_n = len(self.pm.all_entries())
+        self._cat_list.addItem(QListWidgetItem(f"Tutte  ({all_n})"))
+        for c in self.pm.categories():
+            n = len(self.pm.search(category=c))
+            self._cat_list.addItem(QListWidgetItem(f"{c}  ({n})"))
+        for i in range(self._cat_list.count()):
+            if self._cat_list.item(i).text().startswith(self._current_category):
+                self._cat_list.setCurrentRow(i)
+                break
+        else:
+            self._cat_list.setCurrentRow(0)
+        self._cat_list.blockSignals(False)
+
+    def _on_category_selected(self, item):
+        if item is None:
+            return
+        self._current_category = item.text().rsplit("  (", 1)[0]
+        self._refresh_table()
+
+    def _cat_context_menu(self, pos):
+        item = self._cat_list.itemAt(pos)
+        if item is None:
+            return
+        name = item.text().rsplit("  (", 1)[0]
+        if name == "Tutte":
+            return
+        menu = QMenu(self)
+        menu.setStyleSheet(f"""
+            QMenu {{ background: {NAVY_MID}; color: {TEXT_BRIGHT};
+                border: 1px solid #1C3050; }}
+            QMenu::item:selected {{ background: rgba(0,212,255,0.18); }}
+        """)
+        act_rename = menu.addAction("✎  Rinomina")
+        act_delete = menu.addAction("✕  Elimina (sposta in Generale)")
+        act = menu.exec(self._cat_list.viewport().mapToGlobal(pos))
+        if act == act_rename:
+            self._rename_category(name)
+        elif act == act_delete:
+            self._delete_category(name)
+
+    def _new_category(self):
+        name, ok = QInputDialog.getText(self, "Nuova categoria", "Nome categoria:")
+        if ok and name.strip():
+            self._current_category = name.strip()
+            self._rebuild_categories()
+
+    def _rename_category(self, old_name: str):
+        new_name, ok = QInputDialog.getText(
+            self, "Rinomina categoria", "Nuovo nome:", text=old_name)
+        if ok and new_name.strip() and new_name.strip() != old_name:
+            self.pm.rename_category(old_name, new_name.strip())
+            self._current_category = new_name.strip()
+            self._rebuild_categories()
+            self._refresh_table()
+
+    def _delete_category(self, name: str):
+        self.pm.delete_category(name)
+        self._current_category = "Tutte"
+        self._rebuild_categories()
+        self._refresh_table()
+
+    def _refresh_table(self):
+        entries = self.pm.search(
+            query=self._search.text(),
+            category=self._current_category,
+        )
         self.table.setRowCount(len(entries))
+        _ss_act = f"""
+            QPushButton {{
+                background: rgba(0,212,255,0.12); color: {TEAL};
+                border: none; border-radius: 5px; padding: 0 7px; font-size: 12px;
+            }}
+            QPushButton:hover {{ background: rgba(0,212,255,0.28); }}
+        """
         for r, e in enumerate(entries):
             self.table.setItem(r, 0, QTableWidgetItem(e.get("host", "")))
             self.table.setItem(r, 1, QTableWidgetItem(e.get("username", "")))
-            self.table.setItem(r, 2, QTableWidgetItem("\u2022" * 8))
+            self.table.setItem(r, 2, QTableWidgetItem("•" * 8))
+            self.table.setItem(r, 3, QTableWidgetItem(e.get("category", "Generale")))
             self.table.setRowHeight(r, 44)
 
             cell = QWidget()
-            cell_layout = QHBoxLayout(cell)
-            cell_layout.setContentsMargins(4, 4, 4, 4)
-            cell_layout.setSpacing(4)
+            cl = QHBoxLayout(cell)
+            cl.setContentsMargins(4, 4, 4, 4)
+            cl.setSpacing(4)
 
-            btn_show = QPushButton("Mostra")
+            btn_show = QPushButton("\U0001f441")
             btn_show.setFixedHeight(28)
             btn_show.setCursor(Qt.CursorShape.PointingHandCursor)
-            btn_show.setStyleSheet(f"""
-                QPushButton {{ background: rgba(0,212,255,0.15); color: {TEAL}; border: none; border-radius: 5px; padding: 0 8px; font-size: 11px; }}
-                QPushButton:hover {{ background: rgba(0,212,255,0.3); }}
-            """)
-            btn_show.clicked.connect(lambda _, row=r, pw=e["password"]: self._toggle_pw(row, pw))
-            cell_layout.addWidget(btn_show)
+            btn_show.setToolTip("Mostra / nascondi password")
+            btn_show.setStyleSheet(_ss_act)
+            btn_show.clicked.connect(
+                lambda _, row=r, pw=e["password"]: self._toggle_pw(row, pw))
+            cl.addWidget(btn_show)
 
-            btn_copy = QPushButton("Copia")
+            btn_copy = QPushButton("\U0001f4cb")
             btn_copy.setFixedHeight(28)
             btn_copy.setCursor(Qt.CursorShape.PointingHandCursor)
-            btn_copy.setStyleSheet(f"""
-                QPushButton {{ background: rgba(0,212,255,0.15); color: {TEAL}; border: none; border-radius: 5px; padding: 0 8px; font-size: 11px; }}
-                QPushButton:hover {{ background: rgba(0,212,255,0.3); }}
-            """)
-            btn_copy.clicked.connect(lambda _, pw=e["password"]: QApplication.clipboard().setText(pw))
-            cell_layout.addWidget(btn_copy)
+            btn_copy.setToolTip("Copia password")
+            btn_copy.setStyleSheet(_ss_act)
+            btn_copy.clicked.connect(
+                lambda _, pw=e["password"]: QApplication.clipboard().setText(pw))
+            cl.addWidget(btn_copy)
 
-            btn_del = QPushButton("X")
+            btn_edit = QPushButton("✎")
+            btn_edit.setFixedHeight(28)
+            btn_edit.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn_edit.setToolTip("Modifica")
+            btn_edit.setStyleSheet(_ss_act)
+            btn_edit.clicked.connect(
+                lambda _, entry=dict(e): self._edit_entry(entry))
+            cl.addWidget(btn_edit)
+
+            btn_del = QPushButton("✕")
             btn_del.setFixedSize(28, 28)
             btn_del.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn_del.setToolTip("Elimina")
             btn_del.setStyleSheet(f"""
-                QPushButton {{ background: rgba(255,107,107,0.15); color: #FF6B6B; border: none; border-radius: 5px; font-size: 11px; }}
-                QPushButton:hover {{ background: rgba(255,107,107,0.3); }}
+                QPushButton {{
+                    background: rgba(255,107,107,0.12); color: #FF6B6B;
+                    border: none; border-radius: 5px; font-size: 12px;
+                }}
+                QPushButton:hover {{ background: rgba(255,107,107,0.28); }}
             """)
-            btn_del.clicked.connect(lambda _, h=e["host"], u=e["username"]: self._delete_entry(h, u))
-            cell_layout.addWidget(btn_del)
+            btn_del.clicked.connect(
+                lambda _, h=e["host"], u=e["username"]: self._delete_entry(h, u))
+            cl.addWidget(btn_del)
 
-            self.table.setCellWidget(r, 3, cell)
+            self.table.setCellWidget(r, 4, cell)
 
     def _toggle_pw(self, row: int, password: str):
         item = self.table.item(row, 2)
-        if item.text() == "\u2022" * 8:
-            item.setText(password)
-        else:
-            item.setText("\u2022" * 8)
+        if item:
+            item.setText(password if item.text() == "•" * 8 else "•" * 8)
+
+    def _edit_entry(self, entry: dict):
+        cats = self.pm.categories() or ["Generale"]
+        dlg = EditPasswordEntryDialog(entry, cats, self.pm, self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self._rebuild_categories()
+            self._refresh_table()
 
     def _delete_entry(self, host: str, username: str):
         self.pm.delete(host, username)
-        self._fill_table()
+        self._rebuild_categories()
+        self._refresh_table()
+
+    def _open_generator(self):
+        PasswordGeneratorDialog(self).exec()
+
+
+# ── Autofill bar ──────────────────────────────────────────────────────────────
+class AutofillBar(QWidget):
+    """Thin bar shown when saved credentials are available for the current page."""
+
+    fill_requested = pyqtSignal(str, str)  # username, password
+    dismissed      = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("autofill_bar")
+        self.setFixedHeight(38)
+        self.setStyleSheet(f"""
+            QWidget#autofill_bar {{
+                background: #0D2137; border-bottom: 1px solid #1C3050;
+            }}
+            QLabel {{ color: {TEXT_BRIGHT}; font-size: 12px; background: transparent; }}
+        """)
+        self.hide()
+
+        row = QHBoxLayout(self)
+        row.setContentsMargins(14, 0, 8, 0)
+        row.setSpacing(8)
+
+        icon = QLabel("\U0001f511")
+        icon.setFixedWidth(20)
+        row.addWidget(icon)
+
+        self._msg = QLabel("")
+        row.addWidget(self._msg)
+        row.addStretch()
+
+        self._combo = QComboBox()
+        self._combo.setFixedHeight(26)
+        self._combo.setStyleSheet(f"""
+            QComboBox {{
+                background: {NAVY_DEEP}; color: {TEXT_BRIGHT};
+                border: 1px solid #1C3050; border-radius: 4px;
+                padding: 0 6px; font-size: 12px;
+            }}
+            QComboBox::drop-down {{ border: none; }}
+            QComboBox QAbstractItemView {{
+                background: {NAVY_MID}; color: {TEXT_BRIGHT};
+                selection-background-color: rgba(0,212,255,0.2);
+            }}
+        """)
+        self._combo.hide()
+        row.addWidget(self._combo)
+
+        btn_fill = QPushButton("Compila")
+        btn_fill.setFixedHeight(26)
+        btn_fill.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_fill.setStyleSheet(f"""
+            QPushButton {{ background: {TEAL}; color: {NAVY_DEEP};
+                border: none; border-radius: 5px; padding: 2px 12px;
+                font-weight: bold; font-size: 12px; }}
+            QPushButton:hover {{ background: #33DDFF; }}
+        """)
+        btn_fill.clicked.connect(self._on_fill)
+        row.addWidget(btn_fill)
+
+        btn_dismiss = QPushButton("Ignora")
+        btn_dismiss.setFixedHeight(26)
+        btn_dismiss.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_dismiss.setStyleSheet(f"""
+            QPushButton {{ background: rgba(0,212,255,0.15); color: {TEAL};
+                border: none; border-radius: 5px; padding: 2px 10px; font-size: 12px; }}
+            QPushButton:hover {{ background: rgba(0,212,255,0.3); }}
+        """)
+        btn_dismiss.clicked.connect(self._dismiss)
+        row.addWidget(btn_dismiss)
+
+        self._entries: list = []
+
+    def offer(self, entries: list):
+        """Show the bar for a list of credential dicts (host already matched)."""
+        if not entries:
+            self.hide()
+            return
+        self._entries = entries
+        if len(entries) == 1:
+            e = entries[0]
+            self._msg.setText(
+                f"Credenziali salvate per  <b>{e['host']}</b>  ({e['username']})")
+            self._combo.hide()
+        else:
+            self._msg.setText(
+                f"Credenziali salvate per  <b>{entries[0]['host']}</b>:")
+            self._combo.clear()
+            for e in entries:
+                self._combo.addItem(e["username"])
+            self._combo.show()
+        self.show()
+
+    def _on_fill(self):
+        if not self._entries:
+            return
+        idx = max(self._combo.currentIndex(), 0) if self._combo.isVisible() else 0
+        e = self._entries[idx]
+        self.fill_requested.emit(e["username"], e["password"])
+        self.hide()
+        self.dismissed.emit()
+
+    def _dismiss(self):
+        self.hide()
+        self.dismissed.emit()
+
 
 
 # ── Bookmark helpers ─────────────────────────────────────────────────────────
@@ -2761,6 +3345,48 @@ class CalNavWindow(QMainWindow):
         self.password_manager.save(url, username, password)
         self.statusBar().showMessage("Password salvata.", 3000)
 
+    def _on_autofill_fill(self, username: str, password: str):
+        """Inject saved credentials into the current page's login form."""
+        view = self.webview
+        if not view:
+            return
+        # Escape strings for safe JS interpolation
+        u = username.replace("\\", "\\\\").replace("'", "\\'")
+        p = password.replace("\\", "\\\\").replace("'", "\\'")
+        view.page().runJavaScript(f"""
+(function(usr, pwd) {{
+    function setNative(el, val) {{
+        var d = Object.getOwnPropertyDescriptor(
+            window.HTMLInputElement.prototype, 'value');
+        if (d && d.set) d.set.call(el, val);
+        else el.value = val;
+        el.dispatchEvent(new Event('input',  {{bubbles:true}}));
+        el.dispatchEvent(new Event('change', {{bubbles:true}}));
+    }}
+    var pwFields = document.querySelectorAll('input[type="password"]');
+    if (!pwFields.length) return;
+    var userSelectors = [
+        'input[type="email"]', 'input[autocomplete="username"]',
+        'input[autocomplete="email"]', 'input[name*="email" i]',
+        'input[name*="user" i]', 'input[name*="login" i]',
+        'input[id*="email" i]', 'input[id*="user" i]',
+        'input[type="text"]'
+    ];
+    pwFields.forEach(function(pw) {{
+        var container = pw.closest('form') || document;
+        var usrEl = null;
+        for (var s = 0; s < userSelectors.length; s++) {{
+            usrEl = container.querySelector
+                ? container.querySelector(userSelectors[s])
+                : null;
+            if (usrEl) break;
+        }}
+        if (usrEl) setNative(usrEl, usr);
+        setNative(pw, pwd);
+    }});
+}})('{u}', '{p}');
+        """)
+
     # ── Shortcuts ─────────────────────────────────────────────────────────────
     def _setup_shortcuts(self):
         QShortcut(QKeySequence("Ctrl+L"),         self, self._focus_address_bar)
@@ -3592,6 +4218,10 @@ class CalNavWindow(QMainWindow):
         self._save_bar.save_requested.connect(self._on_save_bar_saved)
         vbox.addWidget(self._save_bar)
 
+        self._autofill_bar = AutofillBar()
+        self._autofill_bar.fill_requested.connect(self._on_autofill_fill)
+        vbox.addWidget(self._autofill_bar)
+
         vbox.addWidget(self._build_tab_widget(), stretch=1)
 
         # ── Persistent media control bar ─────────────────────────────────────
@@ -3951,6 +4581,14 @@ class CalNavWindow(QMainWindow):
         self.btn_reload.clicked.disconnect()
         self.btn_reload.clicked.connect(self._toggle_reload)
         self.statusBar().showMessage("Pronto" if ok else "Errore nel caricamento", 5000)
+        # \u2500\u2500 Autofill: offer credentials if we have any for this host \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+        if ok and self.password_manager.available:
+            url = view.url().toString()
+            creds = self.password_manager.get(url)
+            if creds:
+                self._autofill_bar.offer(creds)
+            else:
+                self._autofill_bar.hide()
 
     def _on_title_changed(self, title: str):
         view = self.sender()
