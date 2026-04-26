@@ -39,7 +39,7 @@ from calnav_session import TabGroup, SavedTab, SessionManager
 
 HOME_URL = "https://www.google.com"
 GITHUB_API_URL = (
-    "https://api.github.com/repos/Jorkhan-coder/CalNav-Browser/releases/latest"
+    "https://api.github.com/repos/Jorkhan-coder/CalNav-Browser/releases?per_page=1"
 )
 GITHUB_RELEASES_URL = (
     "https://github.com/Jorkhan-coder/CalNav-Browser/releases/latest"
@@ -2799,6 +2799,9 @@ class UpdateChecker(QObject):
             if reply.error() != QNetworkReply.NetworkError.NoError:
                 return
             data = json.loads(bytes(reply.readAll()).decode())
+            # /releases?per_page=1 returns a list; /releases/latest returns a dict
+            if isinstance(data, list):
+                data = data[0] if data else {}
             tag = data.get("tag_name", "").lstrip("vV").strip()
             if tag and self._is_newer(tag, __version__):
                 self.update_available.emit(tag)
