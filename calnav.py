@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """CalNav Browser — Modern spirit, classic roots."""
 
-__version__ = "1.1.0-alpha"
+__version__ = "1.1.10-alpha"
 
 import json
 import os

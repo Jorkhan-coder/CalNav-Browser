@@ -4,7 +4,7 @@ build-backend = "setuptools.backends.legacy:build"
 
 [project]
 name = "calnav-browser"
-version = "1.1.0a0"
+version = "1.1.10a0"
 description = "CalNav — a custom browser built with PyQt6 and QtWebEngine"
 requires-python = ">=3.10"
 license = { text = "MIT" }
