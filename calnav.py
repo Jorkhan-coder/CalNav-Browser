@@ -45,7 +45,7 @@ GITHUB_RELEASES_URL = (
     "https://github.com/Jorkhan-coder/CalNav-Browser/releases/latest"
 )
 _SETTINGS_FILE = DATA_DIR / "settings.json"
-_SETTINGS_DEFAULTS = {"homepage": HOME_URL}
+_SETTINGS_DEFAULTS = {"homepage": HOME_URL, "theme": "dark"}
 
 
 def _load_settings() -> dict:
@@ -438,18 +438,91 @@ MEDIA_JS = r"""
 })();
 """
 
-# ── Palette ───────────────────────────────────────────────────────────────────
-NAVY_DEEP   = "#07111F"
-NAVY_MID    = "#0D1F3C"
-NAVY_LIGHT  = "#1C2B45"
-TEAL        = "#00D4FF"
-TEAL_DIM    = "#008EAA"
-AMBER       = "#F5A623"
-AMBER_DIM   = "#B87400"
-TEXT_BRIGHT = "#E8F4FD"
-TEXT_DIM    = "#4A7AB5"
-BTN_HOVER   = "rgba(0,212,255,0.14)"
-BTN_PRESS   = "rgba(0,212,255,0.28)"
+# ── Palettes ──────────────────────────────────────────────────────────────────
+_PALETTES = {
+    "dark": {
+        "NAVY_DEEP":   "#07111F",
+        "NAVY_MID":    "#0D1F3C",
+        "NAVY_LIGHT":  "#1C2B45",
+        "TEAL":        "#00D4FF",
+        "TEAL_DIM":    "#008EAA",
+        "AMBER":       "#F5A623",
+        "AMBER_DIM":   "#B87400",
+        "TEXT_BRIGHT": "#E8F4FD",
+        "TEXT_DIM":    "#4A7AB5",
+        "BTN_HOVER":   "rgba(0,212,255,0.14)",
+        "BTN_PRESS":   "rgba(0,212,255,0.28)",
+    },
+    "light": {
+        "NAVY_DEEP":   "#F0F4F8",
+        "NAVY_MID":    "#FFFFFF",
+        "NAVY_LIGHT":  "#DDE6F0",
+        "TEAL":        "#0077AA",
+        "TEAL_DIM":    "#005577",
+        "AMBER":       "#C07800",
+        "AMBER_DIM":   "#9A5E00",
+        "TEXT_BRIGHT": "#0D1F3C",
+        "TEXT_DIM":    "#4A6A8A",
+        "BTN_HOVER":   "rgba(0,119,170,0.10)",
+        "BTN_PRESS":   "rgba(0,119,170,0.22)",
+    },
+}
+_current_theme = "dark"
+
+
+def set_theme(name: str) -> None:
+    """Update all module-level palette globals to the given theme."""
+    global _current_theme
+    global NAVY_DEEP, NAVY_MID, NAVY_LIGHT, TEAL, TEAL_DIM
+    global AMBER, AMBER_DIM, TEXT_BRIGHT, TEXT_DIM, BTN_HOVER, BTN_PRESS
+    _current_theme = name
+    p = _PALETTES.get(name, _PALETTES["dark"])
+    NAVY_DEEP   = p["NAVY_DEEP"]
+    NAVY_MID    = p["NAVY_MID"]
+    NAVY_LIGHT  = p["NAVY_LIGHT"]
+    TEAL        = p["TEAL"]
+    TEAL_DIM    = p["TEAL_DIM"]
+    AMBER       = p["AMBER"]
+    AMBER_DIM   = p["AMBER_DIM"]
+    TEXT_BRIGHT = p["TEXT_BRIGHT"]
+    TEXT_DIM    = p["TEXT_DIM"]
+    BTN_HOVER   = p["BTN_HOVER"]
+    BTN_PRESS   = p["BTN_PRESS"]
+
+
+def _global_qss() -> str:
+    """Base QSS applied at QApplication level for transient widgets."""
+    return f"""
+        QMenu {{
+            background: {NAVY_MID}; color: {TEXT_BRIGHT};
+            border: 1px solid {TEAL_DIM}; border-radius: 6px;
+        }}
+        QMenu::item {{ padding: 5px 22px 5px 14px; }}
+        QMenu::item:selected {{ background: rgba(0,212,255,0.18); color: {TEAL}; }}
+        QMenu::separator {{ height: 1px; background: {NAVY_LIGHT}; margin: 3px 8px; }}
+        QToolTip {{
+            background: {NAVY_MID}; color: {TEXT_BRIGHT};
+            border: 1px solid {TEAL_DIM}; border-radius: 4px; padding: 4px 8px;
+        }}
+        QScrollBar:vertical {{
+            background: {NAVY_DEEP}; width: 8px; border: none; border-radius: 4px;
+        }}
+        QScrollBar::handle:vertical {{
+            background: {TEAL_DIM}; border-radius: 4px; min-height: 20px;
+        }}
+        QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
+        QScrollBar:horizontal {{
+            background: {NAVY_DEEP}; height: 8px; border: none;
+        }}
+        QScrollBar::handle:horizontal {{
+            background: {TEAL_DIM}; border-radius: 4px; min-width: 20px;
+        }}
+        QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{ width: 0; }}
+    """
+
+
+# Initialise globals from dark palette
+set_theme("dark")
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -563,41 +636,58 @@ class SavePasswordBar(QWidget):
 
     def _build(self):
         self.setFixedHeight(46)
-        self.setStyleSheet(
-            f"background: {NAVY_MID}; border-bottom: 1px solid {TEAL_DIM};"
-        )
+        self._apply_style()
         h = QHBoxLayout(self)
         h.setContentsMargins(18, 0, 18, 0)
         h.setSpacing(12)
 
-        icon = QLabel("[*]")
-        icon.setStyleSheet(f"color: {TEAL}; font-size: 14px; font-weight: bold;")
-        h.addWidget(icon)
+        self._icon = QLabel("[*]")
+        self._icon.setStyleSheet(f"color: {TEAL}; font-size: 14px; font-weight: bold;")
+        h.addWidget(self._icon)
 
         self._msg = QLabel("Vuoi salvare la password per questo sito?")
         self._msg.setStyleSheet(f"color: {TEXT_BRIGHT}; font-size: 12px;")
         h.addWidget(self._msg, stretch=1)
 
-        btn_save = QPushButton("Salva")
-        btn_save.setFixedSize(80, 30)
-        btn_save.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn_save.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
-        btn_save.setStyleSheet(f"""
+        self._btn_save = QPushButton("Salva")
+        self._btn_save.setFixedSize(80, 30)
+        self._btn_save.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._btn_save.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
+        self._btn_save.setStyleSheet(f"""
             QPushButton {{ background: {TEAL}; color: {NAVY_DEEP}; border: none; border-radius: 6px; }}
-            QPushButton:hover {{ background: #33DDFF; }}
+            QPushButton:hover {{ background: {TEAL}; filter: brightness(1.15); }}
         """)
-        btn_save.clicked.connect(self._on_save)
-        h.addWidget(btn_save)
+        self._btn_save.clicked.connect(self._on_save)
+        h.addWidget(self._btn_save)
 
-        btn_dismiss = QPushButton("Non ora")
-        btn_dismiss.setFixedSize(80, 30)
-        btn_dismiss.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn_dismiss.setStyleSheet(f"""
-            QPushButton {{ background: transparent; color: {TEXT_DIM}; border: 1px solid #253852; border-radius: 6px; }}
+        self._btn_dismiss = QPushButton("Non ora")
+        self._btn_dismiss.setFixedSize(80, 30)
+        self._btn_dismiss.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._btn_dismiss.setStyleSheet(f"""
+            QPushButton {{ background: transparent; color: {TEXT_DIM}; border: 1px solid {NAVY_LIGHT}; border-radius: 6px; }}
             QPushButton:hover {{ border-color: {TEAL_DIM}; color: {TEXT_BRIGHT}; }}
         """)
-        btn_dismiss.clicked.connect(self.hide)
-        h.addWidget(btn_dismiss)
+        self._btn_dismiss.clicked.connect(self.hide)
+        h.addWidget(self._btn_dismiss)
+
+    def _apply_style(self):
+        self.setStyleSheet(
+            f"background: {NAVY_MID}; border-bottom: 1px solid {TEAL_DIM};"
+        )
+
+    def retheme(self):
+        self._apply_style()
+        if hasattr(self, "_icon"):
+            self._icon.setStyleSheet(f"color: {TEAL}; font-size: 14px; font-weight: bold;")
+            self._msg.setStyleSheet(f"color: {TEXT_BRIGHT}; font-size: 12px;")
+            self._btn_save.setStyleSheet(f"""
+                QPushButton {{ background: {TEAL}; color: {NAVY_DEEP}; border: none; border-radius: 6px; }}
+                QPushButton:hover {{ background: {TEAL}; filter: brightness(1.15); }}
+            """)
+            self._btn_dismiss.setStyleSheet(f"""
+                QPushButton {{ background: transparent; color: {TEXT_DIM}; border: 1px solid {NAVY_LIGHT}; border-radius: 6px; }}
+                QPushButton:hover {{ border-color: {TEAL_DIM}; color: {TEXT_BRIGHT}; }}
+            """)
 
     def offer(self, url: str, username: str, password: str):
         self._url, self._username, self._password = url, username, password
@@ -889,15 +979,6 @@ class PasswordGeneratorDialog(QDialog):
 
     password_accepted = pyqtSignal(str)
 
-    _BTN_GHOST = f"""
-        QPushButton {{
-            background: rgba(0,212,255,0.15); color: {TEAL};
-            border: none; border-radius: 6px; padding: 0 14px;
-            font-size: 12px; font-weight: bold;
-        }}
-        QPushButton:hover {{ background: rgba(0,212,255,0.28); }}
-    """
-
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Genera Password — CalNav")
@@ -907,6 +988,16 @@ class PasswordGeneratorDialog(QDialog):
         self._generate()
 
     def _build(self):
+        _BTN_GHOST = f"""
+            QPushButton {{
+                background: {BTN_HOVER}; color: {TEAL};
+                border: none; border-radius: 6px; padding: 0 14px;
+                font-size: 12px; font-weight: bold;
+            }}
+            QPushButton:hover {{ background: {BTN_PRESS}; }}
+        """
+        self._BTN_GHOST = _BTN_GHOST  # store for buttons added in same method
+
         vbox = QVBoxLayout(self)
         vbox.setContentsMargins(24, 20, 24, 18)
         vbox.setSpacing(14)
@@ -1167,29 +1258,6 @@ class EditPasswordEntryDialog(QDialog):
 class PasswordVaultDialog(QDialog):
     """Full vault: category sidebar, search bar, table, generator shortcut."""
 
-    _TABLE_SS = f"""
-        QTableWidget {{
-            background: {NAVY_DEEP}; gridline-color: #1C3050;
-            color: {TEXT_BRIGHT}; border: 1px solid #1C3050; border-radius: 8px;
-        }}
-        QHeaderView::section {{
-            background: {NAVY_MID}; color: {TEAL};
-            border: none; padding: 6px; font-weight: bold;
-        }}
-        QTableWidget::item {{ padding: 4px 8px; }}
-        QTableWidget::item:selected {{ background: rgba(0,212,255,0.15); }}
-    """
-    _BTN_TEAL = f"""
-        QPushButton {{ background: {TEAL}; color: {NAVY_DEEP};
-            border: none; border-radius: 7px; padding: 0 22px; font-weight: bold; }}
-        QPushButton:hover {{ background: #33DDFF; }}
-    """
-    _BTN_GHOST = f"""
-        QPushButton {{ background: rgba(0,212,255,0.12); color: {TEAL};
-            border: none; border-radius: 7px; padding: 0 14px; font-size: 12px; }}
-        QPushButton:hover {{ background: rgba(0,212,255,0.26); }}
-    """
-
     def __init__(self, password_manager, parent=None):
         super().__init__(parent)
         self.pm = password_manager
@@ -1199,6 +1267,28 @@ class PasswordVaultDialog(QDialog):
         self._build()
 
     def _build(self):
+        _TABLE_SS = f"""
+            QTableWidget {{
+                background: {NAVY_DEEP}; gridline-color: {NAVY_LIGHT};
+                color: {TEXT_BRIGHT}; border: 1px solid {NAVY_LIGHT}; border-radius: 8px;
+            }}
+            QHeaderView::section {{
+                background: {NAVY_MID}; color: {TEAL};
+                border: none; padding: 6px; font-weight: bold;
+            }}
+            QTableWidget::item {{ padding: 4px 8px; }}
+            QTableWidget::item:selected {{ background: {BTN_HOVER}; }}
+        """
+        _BTN_TEAL = f"""
+            QPushButton {{ background: {TEAL}; color: {NAVY_DEEP};
+                border: none; border-radius: 7px; padding: 0 22px; font-weight: bold; }}
+            QPushButton:hover {{ background: {TEAL}; opacity: 0.85; }}
+        """
+        _BTN_GHOST = f"""
+            QPushButton {{ background: {BTN_HOVER}; color: {TEAL};
+                border: none; border-radius: 7px; padding: 0 14px; font-size: 12px; }}
+            QPushButton:hover {{ background: {BTN_PRESS}; }}
+        """
         self.setStyleSheet(f"background: {NAVY_MID}; color: {TEXT_BRIGHT};")
         root = QVBoxLayout(self)
         root.setContentsMargins(18, 16, 18, 14)
@@ -1505,12 +1595,7 @@ class AutofillBar(QWidget):
         super().__init__(parent)
         self.setObjectName("autofill_bar")
         self.setFixedHeight(38)
-        self.setStyleSheet(f"""
-            QWidget#autofill_bar {{
-                background: #0D2137; border-bottom: 1px solid #1C3050;
-            }}
-            QLabel {{ color: {TEXT_BRIGHT}; font-size: 12px; background: transparent; }}
-        """)
+        self.setStyleSheet(self._bar_ss())
         self.hide()
 
         row = QHBoxLayout(self)
@@ -1542,30 +1627,65 @@ class AutofillBar(QWidget):
         self._combo.hide()
         row.addWidget(self._combo)
 
-        btn_fill = QPushButton("Compila")
-        btn_fill.setFixedHeight(26)
-        btn_fill.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn_fill.setStyleSheet(f"""
+        self._btn_fill = QPushButton("Compila")
+        self._btn_fill.setFixedHeight(26)
+        self._btn_fill.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._btn_fill.setStyleSheet(self._fill_btn_ss())
+        self._btn_fill.clicked.connect(self._on_fill)
+        row.addWidget(self._btn_fill)
+
+        self._btn_dismiss = QPushButton("Ignora")
+        self._btn_dismiss.setFixedHeight(26)
+        self._btn_dismiss.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._btn_dismiss.setStyleSheet(self._dismiss_btn_ss())
+        self._btn_dismiss.clicked.connect(self._dismiss)
+        row.addWidget(self._btn_dismiss)
+
+        self._entries: list = []
+
+    def _bar_ss(self) -> str:
+        return f"""
+            QWidget#autofill_bar {{
+                background: {NAVY_MID}; border-bottom: 1px solid {TEAL_DIM};
+            }}
+            QLabel {{ color: {TEXT_BRIGHT}; font-size: 12px; background: transparent; }}
+        """
+
+    def _fill_btn_ss(self) -> str:
+        return f"""
             QPushButton {{ background: {TEAL}; color: {NAVY_DEEP};
                 border: none; border-radius: 5px; padding: 2px 12px;
                 font-weight: bold; font-size: 12px; }}
-            QPushButton:hover {{ background: #33DDFF; }}
-        """)
-        btn_fill.clicked.connect(self._on_fill)
-        row.addWidget(btn_fill)
+            QPushButton:hover {{ background: {TEAL}; opacity: 0.85; }}
+        """
 
-        btn_dismiss = QPushButton("Ignora")
-        btn_dismiss.setFixedHeight(26)
-        btn_dismiss.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn_dismiss.setStyleSheet(f"""
-            QPushButton {{ background: rgba(0,212,255,0.15); color: {TEAL};
+    def _dismiss_btn_ss(self) -> str:
+        return f"""
+            QPushButton {{ background: {BTN_HOVER}; color: {TEAL};
                 border: none; border-radius: 5px; padding: 2px 10px; font-size: 12px; }}
-            QPushButton:hover {{ background: rgba(0,212,255,0.3); }}
-        """)
-        btn_dismiss.clicked.connect(self._dismiss)
-        row.addWidget(btn_dismiss)
+            QPushButton:hover {{ background: {BTN_PRESS}; }}
+        """
 
-        self._entries: list = []
+    def retheme(self):
+        self.setStyleSheet(self._bar_ss())
+        if hasattr(self, "_msg"):
+            self._msg.setStyleSheet(f"color: {TEXT_BRIGHT}; font-size: 12px; background: transparent;")
+        if hasattr(self, "_combo"):
+            self._combo.setStyleSheet(f"""
+                QComboBox {{
+                    background: {NAVY_LIGHT}; color: {TEXT_BRIGHT};
+                    border: 1px solid {TEAL_DIM}; border-radius: 4px;
+                    padding: 0 6px; font-size: 12px;
+                }}
+                QComboBox::drop-down {{ border: none; }}
+                QComboBox QAbstractItemView {{
+                    background: {NAVY_MID}; color: {TEXT_BRIGHT};
+                    selection-background-color: {BTN_HOVER};
+                }}
+            """)
+        if hasattr(self, "_btn_fill"):
+            self._btn_fill.setStyleSheet(self._fill_btn_ss())
+            self._btn_dismiss.setStyleSheet(self._dismiss_btn_ss())
 
     def offer(self, entries: list):
         """Show the bar for a list of credential dicts (host already matched)."""
@@ -2394,6 +2514,14 @@ class CalNavMediaBar(QWidget):
         self.hide()
 
     # ── UI construction ───────────────────────────────────────────────────────
+    def retheme(self):
+        self.setStyleSheet(f"""
+            CalNavMediaBar {{
+                background: {NAVY_MID};
+                border-top: 2px solid {TEAL_DIM};
+            }}
+        """)
+
     def _build(self):
         self.setStyleSheet(f"""
             CalNavMediaBar {{
@@ -2635,6 +2763,9 @@ class UpdateBar(QWidget):
         """)
         btn_x.clicked.connect(self.hide)
         h.addWidget(btn_x)
+
+    def retheme(self):
+        self._msg.setStyleSheet(f"color: {TEXT_BRIGHT}; font-size: 12px;")
 
     def show_update(self, version: str):
         self._msg.setText(
@@ -3124,6 +3255,7 @@ class CalNavWindow(QMainWindow):
         self.resize(1280, 820)
 
         self._settings = _load_settings()
+        set_theme(self._settings.get("theme", "dark"))
         self.profile_manager = ProfileManager()
         self._groups: List[TabGroup] = []        # active tab groups
         self._collapsed_groups: set = set()      # group_ids currently collapsed
@@ -3568,6 +3700,67 @@ class CalNavWindow(QMainWindow):
             )
 
         view.page().runJavaScript(_PIP_JS, _after_js_pip)
+
+    def _toggle_theme(self):
+        new_theme = "light" if _current_theme == "dark" else "dark"
+        set_theme(new_theme)
+        self._settings["theme"] = new_theme
+        from calnav_profiles import DATA_DIR as _DD
+        _save_settings(self._settings)
+        self._retheme()
+
+    def _retheme(self):
+        """Rebuild toolbar and re-style all persistent chrome widgets."""
+        from PyQt6.QtWidgets import QApplication as _QApp
+
+        # Update app-level QSS (menus, scrollbars, tooltips)
+        _QApp.instance().setStyleSheet(_global_qss())
+
+        # Main window background
+        self.setStyleSheet(f"QMainWindow {{ background: {NAVY_DEEP}; }}")
+
+        # Rebuild toolbar in-place
+        vbox = self.centralWidget().layout()
+        old_toolbar = self.toolbar_widget
+        self.toolbar_widget = self._build_toolbar()
+        idx = vbox.indexOf(old_toolbar)
+        if idx >= 0:
+            vbox.insertWidget(idx, self.toolbar_widget)
+            vbox.removeWidget(old_toolbar)
+        old_toolbar.deleteLater()
+
+        # Re-style persistent bars
+        self._save_bar.retheme()
+        self._autofill_bar.retheme()
+        self._media_bar.retheme()
+        self._update_bar.retheme()
+
+        # Progress bar
+        self.progress_bar.setStyleSheet(f"""
+            QProgressBar {{
+                background: {NAVY_LIGHT}; border: none; height: 3px;
+            }}
+            QProgressBar::chunk {{ background: {TEAL}; }}
+        """)
+
+        # Status bar
+        self.statusBar().setStyleSheet(
+            f"background: {NAVY_MID}; color: {TEXT_DIM}; font-size: 11px;"
+        )
+
+        # Apply web color scheme to all open tabs
+        self._apply_web_color_scheme()
+
+    def _apply_web_color_scheme(self):
+        """Tell QtWebEngine which color scheme pages should prefer."""
+        try:
+            from PyQt6.QtWebEngineCore import QWebEngineSettings
+            scheme = (QWebEngineSettings.ColorScheme.Dark
+                      if _current_theme == "dark"
+                      else QWebEngineSettings.ColorScheme.Light)
+            self._web_profile.settings().setColorScheme(scheme)
+        except (AttributeError, ImportError):
+            pass  # Qt < 6.6 — no color scheme API
 
     def _next_tab(self):
         n = self._tab_widget.count()
@@ -4347,6 +4540,14 @@ class CalNavWindow(QMainWindow):
         self.btn_keys.clicked.connect(self._open_password_vault)
         h.addWidget(self.btn_keys)
 
+        # Theme toggle button
+        _is_dark = _current_theme == "dark"
+        self.btn_theme = NavButton("\u2600" if _is_dark else "\U0001f319",
+                                   "Passa a tema chiaro" if _is_dark else "Passa a tema scuro")
+        self.btn_theme.setFont(QFont("Segoe UI", 13))
+        self.btn_theme.clicked.connect(self._toggle_theme)
+        h.addWidget(self.btn_theme)
+
         # Gear button (settings)
         self.btn_settings = NavButton("\u2699", "Impostazioni  Ctrl+,")
         self.btn_settings.setFont(QFont("Segoe UI", 16))
@@ -4671,6 +4872,7 @@ def main():
     app.setStyle("Fusion")
 
     win = CalNavWindow()
+    app.setStyleSheet(_global_qss())
     win.show()
     sys.exit(app.exec())
 
