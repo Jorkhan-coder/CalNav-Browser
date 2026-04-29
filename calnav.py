@@ -32,6 +32,12 @@ from PyQt6.QtCore import (
 from PyQt6.QtGui import QFont, QIcon, QKeySequence, QShortcut, QPainter, QColor
 from PyQt6.QtNetwork import QNetworkAccessManager, QNetworkRequest
 
+try:
+    from PyQt6.QAxContainer import QAxWidget as _QAxWidget
+    _AX_OK = True
+except ImportError:
+    _AX_OK = False
+
 from calnav_profiles import ProfileManager, PROFILE_COLORS, DATA_DIR
 from calnav_passwords import PasswordManager
 from calnav_bookmarks import BookmarkManager, Bookmark, UNCATEGORIZED
@@ -3300,6 +3306,157 @@ class GroupDialog(QDialog):
         return self.name_edit.text().strip(), self.selected_color
 
 
+# ── IE Engine Window (Trident/MSHTML via QAxWidget — Windows only) ───────────
+class IEEngineWindow(QWidget):
+    """Standalone window embedding the real IE/Trident engine.
+
+    Required for sites that use ActiveX controls, such as old HikVision cameras.
+    Available only on Windows with PyQt6.QAxContainer installed.
+    """
+
+    # CLSID of the IE WebBrowser2 COM control
+    _WB_CLSID = "{8856F961-340A-11D0-A96B-00C04FD705A2}"
+
+    def __init__(self, url: str = "", parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        self.setWindowTitle("ℯ Motore IE — CalNav")
+        self.resize(1100, 780)
+        self._ax: "_QAxWidget | None" = None
+        self._build()
+        if url:
+            self._navigate(url)
+
+    # ── UI ────────────────────────────────────────────────────────────────────
+
+    def _build(self):
+        vbox = QVBoxLayout(self)
+        vbox.setContentsMargins(0, 0, 0, 0)
+        vbox.setSpacing(0)
+
+        # Toolbar
+        bar = QWidget()
+        bar.setFixedHeight(42)
+        bar.setStyleSheet(
+            f"background: {NAVY_MID}; border-bottom: 2px solid {AMBER};"
+        )
+        h = QHBoxLayout(bar)
+        h.setContentsMargins(8, 0, 8, 0)
+        h.setSpacing(4)
+
+        btn_back = self._nav_btn("←", "Indietro")
+        btn_back.clicked.connect(self._go_back)
+        h.addWidget(btn_back)
+
+        btn_fwd = self._nav_btn("→", "Avanti")
+        btn_fwd.clicked.connect(self._go_forward)
+        h.addWidget(btn_fwd)
+
+        btn_ref = self._nav_btn("↻", "Ricarica")
+        btn_ref.clicked.connect(self._go_refresh)
+        h.addWidget(btn_ref)
+
+        self._addr = QLineEdit()
+        self._addr.setFont(QFont("Segoe UI", 10))
+        self._addr.setStyleSheet(f"""
+            QLineEdit {{
+                background: {NAVY_LIGHT}; color: {TEXT_BRIGHT};
+                border: 1px solid {TEAL_DIM}; border-radius: 6px;
+                padding: 0 10px; height: 30px;
+            }}
+            QLineEdit:focus {{ border-color: {TEAL}; }}
+        """)
+        self._addr.returnPressed.connect(self._on_addr_enter)
+        h.addWidget(self._addr, stretch=1)
+
+        badge = QLabel("  ℯ Motore IE reale (ActiveX)  ")
+        badge.setStyleSheet(
+            f"color: {NAVY_DEEP}; background: {AMBER}; border-radius: 4px;"
+            f" font-size: 10px; font-weight: bold; padding: 2px 8px; margin: 0 4px;"
+        )
+        h.addWidget(badge)
+        vbox.addWidget(bar)
+
+        # IE WebBrowser2 control
+        try:
+            self._ax = _QAxWidget()
+            self._ax.setControl(self._WB_CLSID)
+            vbox.addWidget(self._ax, stretch=1)
+
+            # Poll LocationURL / LocationName every 500 ms to keep toolbar in sync
+            self._poll = QTimer(self)
+            self._poll.timeout.connect(self._poll_location)
+            self._poll.start(500)
+
+        except Exception as exc:
+            lbl = QLabel(
+                "⚠  Motore IE non disponibile su questo sistema.\n\n"
+                f"{exc}\n\n"
+                "Assicurati che Internet Explorer sia abilitato:\n"
+                "Pannello di controllo → Programmi → "
+                "Attiva o disattiva funzionalità Windows → Internet Explorer 11"
+            )
+            lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            lbl.setWordWrap(True)
+            lbl.setStyleSheet(
+                f"color: {AMBER}; font-size: 13px; padding: 40px;"
+            )
+            vbox.addWidget(lbl)
+
+    @staticmethod
+    def _nav_btn(text: str, tip: str) -> QPushButton:
+        b = QPushButton(text)
+        b.setFixedSize(32, 30)
+        b.setToolTip(tip)
+        b.setCursor(Qt.CursorShape.PointingHandCursor)
+        b.setFont(QFont("Segoe UI", 13))
+        b.setStyleSheet(f"""
+            QPushButton {{ background: transparent; color: {TEXT_BRIGHT};
+                border: none; border-radius: 5px; }}
+            QPushButton:hover {{ background: {BTN_HOVER}; }}
+            QPushButton:pressed {{ background: {BTN_PRESS}; }}
+        """)
+        return b
+
+    # ── Navigation ────────────────────────────────────────────────────────────
+
+    def _navigate(self, url: str):
+        if not url.startswith(("http://", "https://", "file://")):
+            url = "http://" + url
+        self._addr.setText(url)
+        if self._ax:
+            self._ax.dynamicCall("Navigate(const QString&)", url)
+
+    def _on_addr_enter(self):
+        self._navigate(self._addr.text().strip())
+
+    def _go_back(self):
+        if self._ax:
+            self._ax.dynamicCall("GoBack()")
+
+    def _go_forward(self):
+        if self._ax:
+            self._ax.dynamicCall("GoForward()")
+
+    def _go_refresh(self):
+        if self._ax:
+            self._ax.dynamicCall("Refresh()")
+
+    def _poll_location(self):
+        """Keep address bar and title bar in sync with the current page."""
+        if not self._ax:
+            return
+        try:
+            url = self._ax.property("LocationURL") or ""
+            if url and url != self._addr.text():
+                self._addr.setText(url)
+            name = self._ax.property("LocationName") or url
+            if name:
+                self.setWindowTitle(f"ℯ IE — {name}")
+        except Exception:
+            pass
+
+
 # ── Main window ───────────────────────────────────────────────────────────────
 class CalNavWindow(QMainWindow):
     def __init__(self):
@@ -4563,8 +4720,13 @@ class CalNavWindow(QMainWindow):
         self.btn_ie.setFixedSize(58, 38)
         self.btn_ie.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_ie.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
-        self.btn_ie.setToolTip("Modalita compatibilita IE11  Ctrl+I")
+        self.btn_ie.setToolTip(
+            "Clic: modalit\u00e0 UA IE11  Ctrl+I\n"
+            "Clic destro: apri con motore IE reale (ActiveX)"
+        )
         self.btn_ie.clicked.connect(self._toggle_ie_mode)
+        self.btn_ie.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.btn_ie.customContextMenuRequested.connect(self._ie_button_context_menu)
         self._refresh_ie_button_style()
         h.addWidget(self.btn_ie)
 
@@ -4767,6 +4929,42 @@ class CalNavWindow(QMainWindow):
 
         if self.webview:
             self.webview.reload()
+
+    def _ie_button_context_menu(self, pos):
+        """Right-click on the ℯ IE button."""
+        menu = QMenu(self)
+
+        lbl_ua = ("✓  Modalità UA IE11 (attiva)  Ctrl+I"
+                  if self._ie_mode else "ℯ  Modalità UA IE11  Ctrl+I")
+        act_ua = menu.addAction(lbl_ua)
+        act_ua.triggered.connect(self._toggle_ie_mode)
+
+        menu.addSeparator()
+
+        act_real = menu.addAction("🔧  Apri con motore IE reale (ActiveX / HikVision…)")
+        if _AX_OK:
+            act_real.triggered.connect(self._open_ie_engine_window)
+        else:
+            act_real.setEnabled(False)
+            act_real.setToolTip("PyQt6.QAxContainer non disponibile — solo Windows")
+
+        menu.exec(self.btn_ie.mapToGlobal(pos))
+
+    def _open_ie_engine_window(self, url: str = ""):
+        """Open current page (or given URL) in a real Trident/MSHTML window."""
+        if not _AX_OK:
+            from PyQt6.QtWidgets import QMessageBox
+            QMessageBox.warning(
+                self, "Motore IE non disponibile",
+                "PyQt6.QAxContainer non è installato o non è disponibile.\n"
+                "Il modulo è incluso in PyQt6 su Windows.",
+            )
+            return
+        if not url:
+            url = self.webview.url().toString() if self.webview else ""
+        win = IEEngineWindow(url or "about:blank")
+        win.show()
+        win.raise_()
 
     # ── Navigazione ───────────────────────────────────────────────────────────
     def _load_in_view(self, view: QWebEngineView, url: str):
