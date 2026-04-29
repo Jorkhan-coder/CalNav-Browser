@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """CalNav Browser — Modern spirit, classic roots."""
 
-__version__ = "1.1.14-alpha"
+__version__ = "1.1.15-alpha"
 
 import json
 import os
@@ -2830,14 +2830,21 @@ class UpdateBar(QWidget):
 
     @staticmethod
     def _restart():
-        """Relaunch CalNav and exit the current instance."""
-        import subprocess
+        """Relaunch CalNav (using the freshly installed package) and force-exit."""
+        import subprocess, os as _os
         argv0 = sys.argv[0]
-        # Entry-point launcher (calnav / calnav.exe) vs plain script
-        cmd = ([argv0] + sys.argv[1:] if not argv0.endswith(".py")
-               else [sys.executable, argv0] + sys.argv[1:])
+
+        if argv0.endswith(".py"):
+            # Running from source: pip updated site-packages, NOT this local file.
+            # Launch via `python -m calnav` so the installed (updated) package is used.
+            cmd = [sys.executable, "-m", "calnav"]
+        else:
+            # Running via pip entry-point launcher (calnav.exe / calnav) — reuse it.
+            cmd = [argv0] + sys.argv[1:]
+
         subprocess.Popen(cmd)
-        QApplication.instance().quit()
+        # os._exit() bypasses Qt's event loop and guarantees the old process exits.
+        _os._exit(0)
 
 
 # ── Update checker ────────────────────────────────────────────────────────────
