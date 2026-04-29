@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """CalNav Browser — Modern spirit, classic roots."""
 
-__version__ = "1.1.19-alpha"
+__version__ = "1.1.20-alpha"
 
 import json
 import os
@@ -5116,7 +5116,23 @@ def _suppress_qt_warnings():
     qInstallMessageHandler(_handler)
 
 
+def _hide_console():
+    """Hide the console window on Windows (works with both python.exe and pythonw.exe)."""
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+        if hwnd:
+            ctypes.windll.user32.ShowWindow(hwnd, 0)  # SW_HIDE
+    except Exception:
+        pass
+
+
 def main():
+    # ── Hide console window immediately (before QApplication) ─────────────────
+    _hide_console()
+
     # ── Suppress Qt/Chromium noise before anything else ───────────────────────
     _suppress_qt_warnings()
 
