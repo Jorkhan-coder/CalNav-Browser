@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """CalNav Browser — Modern spirit, classic roots."""
 
-__version__ = "1.1.16-alpha"
+__version__ = "1.1.17-alpha"
 
 import json
 import os
@@ -5087,7 +5087,33 @@ def _app_icon() -> QIcon:
     return QIcon()
 
 
+def _suppress_qt_warnings():
+    """Silence noisy Qt/Chromium debug messages (CSS filter, JS channel errors)."""
+    from PyQt6.QtCore import qInstallMessageHandler, QtMsgType
+
+    _IGNORE = (
+        "Unknown property filter",
+        "execCallbacks",
+        "qrc:/qtwebchannel",
+        "Blocked script",
+        "Content Security Policy",
+    )
+
+    def _handler(msg_type, _ctx, msg):
+        if msg_type in (QtMsgType.QtDebugMsg, QtMsgType.QtInfoMsg):
+            return
+        if any(s in msg for s in _IGNORE):
+            return
+        # Let genuine warnings/criticals through to stderr
+        print(msg, file=__import__("sys").stderr)
+
+    qInstallMessageHandler(_handler)
+
+
 def main():
+    # ── Suppress Qt/Chromium noise before anything else ───────────────────────
+    _suppress_qt_warnings()
+
     # ── Chromium flags (must be set BEFORE QApplication is created) ──────────
     _existing = os.environ.get("QTWEBENGINE_CHROMIUM_FLAGS", "")
 
