@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """CalNav Browser — Modern spirit, classic roots."""
 
-__version__ = "1.1.18-alpha"
+__version__ = "1.1.19-alpha"
 
 import json
 import os
@@ -4974,6 +4974,12 @@ class CalNavWindow(QMainWindow):
         if not url:
             url = self.webview.url().toString() if self.webview else ""
         win = IEEngineWindow(url or "about:blank")
+        # Keep a Python reference so the window isn't garbage-collected on return
+        if not hasattr(self, "_ie_windows"):
+            self._ie_windows = []
+        self._ie_windows.append(win)
+        win.destroyed.connect(lambda: self._ie_windows.remove(win)
+                              if win in self._ie_windows else None)
         win.show()
         win.raise_()
 
