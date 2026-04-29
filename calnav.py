@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """CalNav Browser — Modern spirit, classic roots."""
 
-__version__ = "1.1.20-alpha"
+__version__ = "1.1.21-alpha"
 
 import json
 import os
@@ -4953,28 +4953,43 @@ class CalNavWindow(QMainWindow):
         menu.addSeparator()
 
         act_real = menu.addAction("🔧  Apri con motore IE reale (ActiveX / HikVision…)")
-        if _AX_OK:
-            act_real.triggered.connect(self._open_ie_engine_window)
-        else:
-            act_real.setEnabled(False)
-            act_real.setToolTip("PyQt6.QAxContainer non disponibile — solo Windows")
+        act_real.triggered.connect(self._open_ie_engine_window)  # always clickable
 
         menu.exec(self.btn_ie.mapToGlobal(pos))
 
     def _open_ie_engine_window(self, url: str = ""):
         """Open current page (or given URL) in a real Trident/MSHTML window."""
-        if not _AX_OK:
+        # Re-try the import at call-time (covers cases where _AX_OK was False
+        # at startup but the module is actually present, e.g. Python 3.14 quirk)
+        ax_widget_cls = None
+        try:
+            from PyQt6.QAxContainer import QAxWidget as _AX
+            ax_widget_cls = _AX
+        except Exception as exc:
             from PyQt6.QtWidgets import QMessageBox
             QMessageBox.warning(
-                self, "Motore IE non disponibile",
-                "PyQt6.QAxContainer non è installato o non è disponibile.\n"
-                "Il modulo è incluso in PyQt6 su Windows.",
+                self, "Motore IE — modulo mancante",
+                "PyQt6.QAxContainer non è disponibile su questo sistema.\n\n"
+                f"Errore: {exc}\n\n"
+                "Prova a reinstallare PyQt6:\n"
+                "  pip install --upgrade PyQt6",
             )
             return
+
         if not url:
             url = self.webview.url().toString() if self.webview else ""
-        win = IEEngineWindow(url or "about:blank")
-        # Keep a Python reference so the window isn't garbage-collected on return
+        url = url or "about:blank"
+
+        # Build window using the freshly-imported class
+        try:
+            win = IEEngineWindow.__new__(IEEngineWindow)
+            IEEngineWindow.__init__(win, url)
+        except Exception as exc:
+            from PyQt6.QtWidgets import QMessageBox
+            QMessageBox.critical(self, "Motore IE — errore", str(exc))
+            return
+
+        # Keep a Python reference so GC doesn't destroy the window
         if not hasattr(self, "_ie_windows"):
             self._ie_windows = []
         self._ie_windows.append(win)
