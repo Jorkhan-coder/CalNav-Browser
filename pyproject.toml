@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "calnav-browser"
-version = "1.1.15a0"
+version = "1.1.16a0"
 description = "CalNav — a custom browser built with PyQt6 and QtWebEngine"
 requires-python = ">=3.10"
 license = { text = "MIT" }
@@ -28,6 +28,9 @@ py-modules = [
     "calnav_profiles",
     "calnav_session",
 ]
+
+[tool.setuptools.package-data]
+"*" = ["logo_browser.ico"]
 
 [project.optional-dependencies]
 # Build a standalone executable (Windows only)
