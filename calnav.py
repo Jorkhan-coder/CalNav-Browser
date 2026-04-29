@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """CalNav Browser — Modern spirit, classic roots."""
 
-__version__ = "1.1.13-alpha"
+__version__ = "1.1.14-alpha"
 
 import json
 import os
@@ -1295,6 +1295,10 @@ class PasswordVaultDialog(QDialog):
                 border: none; border-radius: 7px; padding: 0 14px; font-size: 12px; }}
             QPushButton:hover {{ background: {BTN_PRESS}; }}
         """
+        # Store as instance attrs so _refresh_table() and other methods can use them
+        self._TABLE_SS = _TABLE_SS
+        self._BTN_TEAL = _BTN_TEAL
+        self._BTN_GHOST = _BTN_GHOST
         self.setStyleSheet(f"background: {NAVY_MID}; color: {TEXT_BRIGHT};")
         root = QVBoxLayout(self)
         root.setContentsMargins(18, 16, 18, 14)
