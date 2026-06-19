@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """CalNav Browser — Modern spirit, classic roots."""
 
-__version__ = "1.1.23-alpha"
+__version__ = "1.1.24-alpha"
 
 import json
 import os
@@ -2465,6 +2465,20 @@ class CalNavPiPWindow(QWidget):
         '  z-index: 9999 !important;' +
         '}';
     document.head.appendChild(s);
+
+    // Force playback: YouTube may not autoplay a freshly-loaded watch page.
+    var vid = document.querySelector('video');
+    if (vid) {
+        vid.muted = false;
+        var tries = 0;
+        var timer = setInterval(function() {
+            tries++;
+            if (!vid.paused || tries > 12) { clearInterval(timer); return; }
+            var btn = document.querySelector('.ytp-large-play-button, .ytp-play-button');
+            if (btn) btn.click();
+            vid.play().catch(function(){});
+        }, 600);
+    }
 })();
 """
 
@@ -2519,7 +2533,7 @@ class CalNavMediaBar(QWidget):
     ───────────────
     • Play / Pause, ±10 s seek buttons and a draggable seek slider
     • Volume wheel
-    • ⧉ PiP button — requests Picture-in-Picture via the Web API
+    • ⧉ PiP button — opens the floating CalNavPiPWindow mini-player
     • Small pulsing dot painted on the tab bar for tabs with active media
       (implemented in CalNavTabBar._paint_group_overlays via a resolver)
     """
@@ -3995,76 +4009,72 @@ class CalNavWindow(QMainWindow):
                 pass  # view was already deleted
             self._pip_source_view = None
 
-    def _media_pip(self):
-        """Open Picture-in-Picture for the active tab's video.
+    @staticmethod
+    def _youtube_id(url: str) -> str:
+        """Extract an 11-char YouTube video id from a watch/short/embed URL."""
+        import re
+        m = re.search(
+            r"(?:youtube\.com/watch\?(?:.*&)?v=|youtu\.be/|"
+            r"youtube\.com/embed/|youtube\.com/shorts/)([\w-]{11})",
+            url,
+        )
+        return m.group(1) if m else ""
 
-        Strategy
-        ────────
-        1. Qt 6.8+ TogglePictureInPicture WebAction — promotes the EXISTING
-           <video> element into the OS PiP overlay.  No new page load, no ads,
-           perfectly in sync with the original tab.  Works for YouTube, Twitch,
-           and any other site with a <video> element.
-        2. JS requestPictureInPicture() — same idea via the Web API.  Requires
-           --disable-features=UserActivationV2 so runJavaScript() counts as a
-           trusted user gesture.
-        3. CalNavPiPWindow fallback — only for direct http/https video URLs
-           (non-blob) where neither native approach succeeded.  blob: / MSE /
-           DRM streams cannot be transferred to another renderer and are skipped.
+    def _media_pip(self):
+        """Open the floating mini-player for the active tab's video.
+
+        QtWebEngine 6.x ships WITHOUT native Picture-in-Picture
+        (document.pictureInPictureEnabled is always false and there is no
+        TogglePictureInPicture WebAction), so the Web PiP API can never work
+        here.  Instead we use our own always-on-top CalNavPiPWindow, which is
+        engine-independent:
+          • YouTube  → reload the watch page in the mini window, cropped to
+            the player (shares cookies/login via the same profile).
+          • direct video URL (non-blob)  → plain <video> element.
+          • anything else (blob/MSE: Twitch, Vimeo, …)  → reload the page URL
+            in the mini window (no UI cropping, but the video plays).
         """
         view = self.webview
         if not view:
             return
 
         title = view.title() or ""
+        page_url = view.url().toString()
 
-        # ── 1. Native Qt WebAction (Qt 6.8+, trusted context) ────────────────
-        # triggerPageAction runs in a trusted renderer context, satisfying the
-        # user-gesture requirement without any Chromium flag gymnastics.
-        pip_action = getattr(QWebEnginePage.WebAction, "TogglePictureInPicture", None)
-        if pip_action is not None:
+        def _open(info):
+            info = info if isinstance(info, dict) else {}
             try:
-                view.page().triggerPageAction(pip_action)
-                return
-            except Exception:
+                cur = float(info.get("t", 0) or 0)
+            except (TypeError, ValueError):
+                cur = 0.0
+            src = info.get("src", "") or ""
+
+            pip = self._ensure_pip_window()
+            vid = self._youtube_id(page_url)
+            if vid:
+                pip.play_youtube(vid, cur, title)
+            elif src and not src.startswith("blob:"):
+                pip.play_direct(src, cur, title)
+            else:
+                pip.play_url(page_url, title)
+
+            # Mute + pause the source tab so audio isn't played twice.
+            self._pip_source_view = view
+            try:
+                view.page().setAudioMuted(True)
+            except RuntimeError:
                 pass
-
-        # ── 2. JS requestPictureInPicture() ──────────────────────────────────
-        # Works when --disable-features=UserActivationV2 is set (see main()).
-        _PIP_JS = (
-            "(function(){"
-            "var v=document.querySelector('video');"
-            "if(v&&document.pictureInPictureEnabled){"
-            "  v.requestPictureInPicture().catch(function(){});"
-            "  return true;"
-            "}"
-            "return false;"
-            "})()"
-        )
-
-        def _after_js_pip(ok):
-            if ok:
-                return  # JS PiP accepted — done
-
-            # ── 3. CalNavPiPWindow for direct transferable URLs ───────────────
-            state = self._media_states.get(view, {})
-            src = state.get("src", "")
-            if not src or src.startswith("blob:"):
-                return  # blob: / MSE cannot be transferred
-
-            def _open_direct(t):
-                pip = self._ensure_pip_window()
-                pip.play_direct(src, t or 0, title)
-                _show_pip(pip)
-
             view.page().runJavaScript(
-                "(function(){"
-                "var v=document.querySelector('video,audio');"
-                "return v?v.currentTime:0;"
-                "})()",
-                _open_direct,
+                "(function(){var v=document.querySelector('video,audio');"
+                "if(v)v.pause();})()"
             )
+            _show_pip(pip)
 
-        view.page().runJavaScript(_PIP_JS, _after_js_pip)
+        view.page().runJavaScript(
+            "(function(){var v=document.querySelector('video,audio');"
+            "return {t:v?v.currentTime:0, src:v?(v.currentSrc||v.src||''):''};})()",
+            _open,
+        )
 
     def _toggle_theme(self):
         new_theme = "light" if _current_theme == "dark" else "dark"
@@ -5292,11 +5302,7 @@ def main():
         # On Windows N (no Media Feature Pack) or when GPU H.264 decode is
         # blocked, Chromium silently fails the hardware path and reports
         # "codec not supported".  This flag bypasses that path entirely.
-        "--disable-accelerated-video-decode "
-        # Allow requestPictureInPicture() called from runJavaScript() to be
-        # treated as a trusted user gesture.  Without this flag the Web API
-        # rejects PiP requests that didn't originate from a real click/keypress.
-        "--disable-features=UserActivationV2"
+        "--disable-accelerated-video-decode"
     )
     if "--autoplay-policy=no-user-gesture-required" not in _existing:
         os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = (
