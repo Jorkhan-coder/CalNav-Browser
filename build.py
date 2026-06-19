@@ -21,7 +21,7 @@ if hasattr(sys.stdout, "reconfigure"):
 # -- Configurazione ------------------------------------------------------------
 ROOT        = Path(__file__).parent.resolve()
 APP_NAME    = "CalNav"
-APP_VERSION = "1.1.22-alpha"
+APP_VERSION = "1.1.23-alpha"
 ICON_FILE   = ROOT / "logo_browser.ico"
 DIST_DIR    = ROOT / "dist"
 BUILD_DIR   = ROOT / "build"
@@ -389,9 +389,11 @@ def make_installer():
             Tasks: desktopicon
 
         [Run]
+        ; No 'skipifsilent' — the in-app auto-updater installs with /SILENT and
+        ; relies on this entry to relaunch CalNav after the update.
         Filename: "{{app}}\\{APP_NAME}.exe"; \\
             Description: "Avvia {APP_NAME} adesso"; \\
-            Flags: nowait postinstall skipifsilent
+            Flags: nowait postinstall
 
         [UninstallDelete]
         Type: filesandordirs; Name: "{{app}}"

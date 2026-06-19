@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """CalNav Browser — Modern spirit, classic roots."""
 
-__version__ = "1.1.22-alpha"
+__version__ = "1.1.23-alpha"
 
 import json
 import os
@@ -2752,6 +2752,10 @@ class UpdateBar(QWidget):
         super().__init__(parent)
         self._process: QProcess | None = None
         self._new_version = ""
+        self._installer_url = ""
+        self._installer_path = ""
+        self._dl_nam = None
+        self._dl_reply = None
         self._build()
         self.hide()
 
@@ -2796,8 +2800,9 @@ class UpdateBar(QWidget):
     def retheme(self):
         self._msg.setStyleSheet(f"color: {TEXT_BRIGHT}; font-size: 12px;")
 
-    def show_update(self, version: str):
+    def show_update(self, version: str, installer_url: str = ""):
         self._new_version = version
+        self._installer_url = installer_url
         self._set_idle(f"Disponibile CalNav {version}  —  stai usando la {__version__}")
         self.show()
 
@@ -2830,6 +2835,16 @@ class UpdateBar(QWidget):
     # ── Auto-update logic ─────────────────────────────────────────────────────
 
     def _on_update(self):
+        # A PyInstaller-frozen build has no usable `pip` (sys.executable is
+        # CalNav.exe, not python), and even if it did, `pip install` wouldn't
+        # touch the bundled code.  So the frozen build downloads & runs the
+        # release installer instead; only a source checkout uses pip.
+        if getattr(sys, "frozen", False):
+            self._update_frozen()
+        else:
+            self._update_from_source()
+
+    def _update_from_source(self):
         self._set_busy("⏳  Aggiornamento in corso, attendere…")
         self._process = QProcess(self)
         self._process.setProcessChannelMode(
@@ -2841,6 +2856,73 @@ class UpdateBar(QWidget):
             "--no-cache-dir",   # always fetch fresh from git
             _GITHUB_PKG,
         ])
+
+    # ── Frozen-build update: download Setup.exe and run it ─────────────────────
+    def _update_frozen(self):
+        if not self._installer_url:
+            self._set_error("❌  Installer non trovato nella release — aggiorna manualmente.")
+            return
+        self._set_busy("⏳  Download aggiornamento…  0%")
+        import tempfile, os as _os
+        self._installer_path = _os.path.join(
+            tempfile.gettempdir(), f"CalNav-{self._new_version}-Setup.exe")
+
+        self._dl_nam = QNetworkAccessManager(self)
+        req = QNetworkRequest(QUrl(self._installer_url))
+        req.setRawHeader(b"User-Agent", b"CalNav-Browser-Updater")
+        # GitHub asset URLs 302-redirect to the CDN; follow them.
+        req.setAttribute(
+            QNetworkRequest.Attribute.RedirectPolicyAttribute,
+            QNetworkRequest.RedirectPolicy.NoLessSafeRedirectPolicy,
+        )
+        self._dl_reply = self._dl_nam.get(req)
+        self._dl_reply.downloadProgress.connect(self._on_dl_progress)
+        self._dl_reply.finished.connect(self._on_dl_finished)
+
+    def _on_dl_progress(self, received: int, total: int):
+        if total > 0:
+            self._set_busy(f"⏳  Download aggiornamento…  {received * 100 // total}%")
+
+    def _on_dl_finished(self):
+        from PyQt6.QtNetwork import QNetworkReply
+        reply, self._dl_reply = self._dl_reply, None
+        if reply.error() != QNetworkReply.NetworkError.NoError:
+            self._set_error(f"❌  Download fallito: {reply.errorString()[:80]}")
+            reply.deleteLater()
+            return
+        try:
+            with open(self._installer_path, "wb") as f:
+                f.write(bytes(reply.readAll()))
+        except OSError as e:
+            self._set_error(f"❌  Salvataggio fallito: {str(e)[:80]}")
+            reply.deleteLater()
+            return
+        reply.deleteLater()
+        self._set_done(f"✅  Installazione {self._new_version} — riavvio…")
+        QTimer.singleShot(800, self._run_installer)
+
+    def _run_installer(self):
+        """Launch the Inno Setup installer silently, then quit so it can replace
+        our files; the installer's [Run] step relaunches CalNav on the homepage.
+
+        The installer requires admin, so it must be launched via ShellExecute
+        'runas' (CreateProcess/subprocess would fail with "requires elevation").
+        """
+        import ctypes, os as _os
+        params = ("/SILENT /SUPPRESSMSGBOXES /CLOSEAPPLICATIONS "
+                  "/RESTARTAPPLICATIONS /NORESTART")
+        try:
+            ret = ctypes.windll.shell32.ShellExecuteW(
+                None, "runas", self._installer_path, params, None, 1)
+        except Exception as e:
+            self._set_error(f"❌  Avvio installer fallito: {str(e)[:80]}")
+            return
+        if ret <= 32:
+            # ShellExecute failed or the user dismissed the UAC prompt — keep
+            # the current app running instead of closing into nothing.
+            self._set_error("❌  Aggiornamento annullato (elevazione negata).")
+            return
+        _os._exit(0)
 
     def _on_pip_done(self, exit_code: int, _exit_status):
         output = bytes(self._process.readAll()).decode(errors="replace")
@@ -2878,7 +2960,7 @@ class UpdateBar(QWidget):
 
 # ── Update checker ────────────────────────────────────────────────────────────
 class UpdateChecker(QObject):
-    update_available = pyqtSignal(str)   # nuova versione
+    update_available = pyqtSignal(str, str)   # (nuova versione, url installer .exe)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -2902,7 +2984,13 @@ class UpdateChecker(QObject):
                 data = data[0] if data else {}
             tag = data.get("tag_name", "").lstrip("vV").strip()
             if tag and self._is_newer(tag, __version__):
-                self.update_available.emit(tag)
+                # Grab the Setup.exe asset URL so the frozen build can self-update.
+                installer_url = ""
+                for asset in data.get("assets", []):
+                    if asset.get("name", "").lower().endswith("setup.exe"):
+                        installer_url = asset.get("browser_download_url", "")
+                        break
+                self.update_available.emit(tag, installer_url)
         except Exception:
             pass
         finally:
