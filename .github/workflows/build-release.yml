@@ -32,6 +32,7 @@ jobs:
             PyQt6 `
             PyQt6-WebEngine `
             cryptography `
+            comtypes `
             pyinstaller `
             pillow
 

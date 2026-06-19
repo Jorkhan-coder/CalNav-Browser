@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "calnav-browser"
-version = "1.1.21a0"
+version = "1.1.22a0"
 description = "CalNav — a custom browser built with PyQt6 and QtWebEngine"
 requires-python = ">=3.10"
 license = { text = "MIT" }
@@ -14,6 +14,7 @@ dependencies = [
     "PyQt6>=6.4.0",
     "PyQt6-WebEngine>=6.4.0",
     "cryptography>=41.0.0",
+    "comtypes>=1.4.0; sys_platform=='win32'",
 ]
 
 [project.scripts]
@@ -24,6 +25,7 @@ calnav = "calnav:main"
 py-modules = [
     "calnav",
     "calnav_bookmarks",
+    "calnav_ie_host",
     "calnav_passwords",
     "calnav_profiles",
     "calnav_session",

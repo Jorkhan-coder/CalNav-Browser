@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """CalNav Browser — Modern spirit, classic roots."""
 
-__version__ = "1.1.21-alpha"
+__version__ = "1.1.22-alpha"
 
 import json
 import os
@@ -32,14 +32,10 @@ from PyQt6.QtCore import (
 from PyQt6.QtGui import QFont, QIcon, QKeySequence, QShortcut, QPainter, QColor
 from PyQt6.QtNetwork import QNetworkAccessManager, QNetworkRequest
 
-try:
-    from PyQt6.QAxContainer import QAxWidget as _QAxWidget
-    _AX_OK = True
-except ImportError:
-    _AX_OK = False
+from calnav_ie_host import IEEmbedWidget, IE_AVAILABLE, IE_UNAVAILABLE_REASON
 
 from calnav_profiles import ProfileManager, PROFILE_COLORS, DATA_DIR
-from calnav_passwords import PasswordManager
+from calnav_passwords import PasswordManager, _host as _pw_host
 from calnav_bookmarks import BookmarkManager, Bookmark, UNCATEGORIZED
 from calnav_session import TabGroup, SavedTab, SessionManager
 
@@ -497,7 +493,25 @@ def set_theme(name: str) -> None:
 
 
 def _global_qss() -> str:
-    """Base QSS applied at QApplication level for transient widgets."""
+    """Chrome QSS applied at the MAIN-WINDOW level (never on QApplication).
+
+    Applying generic type selectors (QScrollBar, QMenu, …) on the
+    QApplication makes them bleed into QtWebEngine's auxiliary widgets — the
+    native ``<select>`` dropdown popup and the Picture-in-Picture overlay.
+    That bleed is what caused the ``<select>`` popup to grow without bound
+    (the all-white expanding shadow) and broke PiP.  Scrollbar rules are
+    therefore scoped to the specific chrome containers we actually use, so
+    they can never match the web popups.
+    """
+    # Containers in our own chrome that host scrollbars.  Deliberately does
+    # NOT include bare QScrollBar / QAbstractScrollArea / QListView so the
+    # QtWebEngine <select> popup is left untouched.
+    _SB_HOSTS = ("QTableWidget", "QListWidget", "QTextEdit", "QPlainTextEdit", "QScrollArea")
+
+    def _sb(sub: str) -> str:
+        """Scope a QScrollBar sub-selector to our chrome containers only."""
+        return ", ".join(f"{host} {sub}" for host in _SB_HOSTS)
+
     return f"""
         QMenu {{
             background: {NAVY_MID}; color: {TEXT_BRIGHT};
@@ -510,20 +524,18 @@ def _global_qss() -> str:
             background: {NAVY_MID}; color: {TEXT_BRIGHT};
             border: 1px solid {TEAL_DIM}; border-radius: 4px; padding: 4px 8px;
         }}
-        QScrollBar:vertical {{
+        {_sb("QScrollBar:vertical")} {{
             background: {NAVY_DEEP}; width: 8px; border: none; border-radius: 4px;
         }}
-        QScrollBar::handle:vertical {{
+        {_sb("QScrollBar::handle:vertical")} {{
             background: {TEAL_DIM}; border-radius: 4px; min-height: 20px;
         }}
-        QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
-        QScrollBar:horizontal {{
+        {_sb("QScrollBar:horizontal")} {{
             background: {NAVY_DEEP}; height: 8px; border: none;
         }}
-        QScrollBar::handle:horizontal {{
+        {_sb("QScrollBar::handle:horizontal")} {{
             background: {TEAL_DIM}; border-radius: 4px; min-width: 20px;
         }}
-        QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{ width: 0; }}
     """
 
 
@@ -633,6 +645,7 @@ class CalNavBridge(QObject):
 # ── Save-password notification bar ───────────────────────────────────────────
 class SavePasswordBar(QWidget):
     save_requested = pyqtSignal(str, str, str)
+    dismissed      = pyqtSignal(str, str)  # (url, username) — user clicked "Non ora"
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -673,7 +686,7 @@ class SavePasswordBar(QWidget):
             QPushButton {{ background: transparent; color: {TEXT_DIM}; border: 1px solid {NAVY_LIGHT}; border-radius: 6px; }}
             QPushButton:hover {{ border-color: {TEAL_DIM}; color: {TEXT_BRIGHT}; }}
         """)
-        self._btn_dismiss.clicked.connect(self.hide)
+        self._btn_dismiss.clicked.connect(self._on_dismiss)
         h.addWidget(self._btn_dismiss)
 
     def _apply_style(self):
@@ -708,6 +721,10 @@ class SavePasswordBar(QWidget):
     def _on_save(self):
         self.hide()
         self.save_requested.emit(self._url, self._username, self._password)
+
+    def _on_dismiss(self):
+        self.hide()
+        self.dismissed.emit(self._url, self._username)
 
 
 # ── Profile avatar button ─────────────────────────────────────────────────────
@@ -2815,35 +2832,47 @@ class UpdateBar(QWidget):
     def _on_update(self):
         self._set_busy("⏳  Aggiornamento in corso, attendere…")
         self._process = QProcess(self)
+        self._process.setProcessChannelMode(
+            QProcess.ProcessChannelMode.MergedChannels)   # stdout+stderr together
         self._process.finished.connect(self._on_pip_done)
-        self._process.start(sys.executable,
-                            ["-m", "pip", "install", "--upgrade", _GITHUB_PKG])
+        self._process.start(sys.executable, [
+            "-m", "pip", "install",
+            "--upgrade",
+            "--no-cache-dir",   # always fetch fresh from git
+            _GITHUB_PKG,
+        ])
 
     def _on_pip_done(self, exit_code: int, _exit_status):
-        if exit_code == 0:
-            self._set_done("✅  Aggiornamento completato! Riavvio in corso…")
-            QTimer.singleShot(1800, self._restart)
-        else:
-            stderr = bytes(self._process.readAllStandardError()).decode(errors="replace")
-            brief = stderr.strip().splitlines()[-1] if stderr.strip() else "errore sconosciuto"
-            self._set_error(f"❌  Aggiornamento fallito: {brief[:80]}")
+        output = bytes(self._process.readAll()).decode(errors="replace")
+
+        if exit_code != 0:
+            lines = output.strip().splitlines()
+            brief = next((l for l in reversed(lines) if l.strip()), "unknown error")
+            self._set_error(f"❌  Update failed: {brief[:90]}")
+            return
+
+        # Extract the installed version from pip's output
+        # pip prints "Successfully installed calnav-browser-X.Y.Z"
+        import re as _re
+        m = _re.search(r"calnav[_-]browser[_-]([\d.\w-]+)", output, _re.I)
+        ver = m.group(1) if m else self._new_version
+        self._set_done(f"✅  Installed {ver} — restarting…")
+        QTimer.singleShot(1800, self._restart)
 
     @staticmethod
     def _restart():
-        """Relaunch CalNav (using the freshly installed package) and force-exit."""
+        """Relaunch CalNav using the freshly installed package, then force-exit."""
         import subprocess, os as _os
         argv0 = sys.argv[0]
 
         if argv0.endswith(".py"):
-            # Running from source: pip updated site-packages, NOT this local file.
-            # Launch via `python -m calnav` so the installed (updated) package is used.
+            # Running from source: use installed package via -m
             cmd = [sys.executable, "-m", "calnav"]
         else:
-            # Running via pip entry-point launcher (calnav.exe / calnav) — reuse it.
+            # Running via pip entry-point launcher (calnav.exe)
             cmd = [argv0] + sys.argv[1:]
 
         subprocess.Popen(cmd)
-        # os._exit() bypasses Qt's event loop and guarantees the old process exits.
         _os._exit(0)
 
 
@@ -3317,26 +3346,22 @@ class GroupDialog(QDialog):
         return self.name_edit.text().strip(), self.selected_color
 
 
-# ── IE Engine Window (Trident/MSHTML via QAxWidget — Windows only) ───────────
+# ── IE Engine Window (MSHTML/WebBrowser2 via comtypes — Windows only) ─────────
 class IEEngineWindow(QWidget):
-    """Standalone window embedding the real IE/Trident engine.
+    """Standalone window embedding the real IE/Trident engine via comtypes.
 
-    Required for sites that use ActiveX controls, such as old HikVision cameras.
-    Available only on Windows with PyQt6.QAxContainer installed.
+    Required for sites that use ActiveX controls (e.g. HikVision cameras).
+    Requires: pip install comtypes
     """
-
-    # CLSID of the IE WebBrowser2 COM control
-    _WB_CLSID = "{8856F961-340A-11D0-A96B-00C04FD705A2}"
 
     def __init__(self, url: str = "", parent=None):
         super().__init__(parent)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         self.setWindowTitle("ℯ Motore IE — CalNav")
         self.resize(1100, 780)
-        self._ax: "_QAxWidget | None" = None
+        self._embed: "IEEmbedWidget | None" = None
+        self._pending_url = url   # stored for deferred post-init navigation
         self._build()
-        if url:
-            self._navigate(url)
 
     # ── UI ────────────────────────────────────────────────────────────────────
 
@@ -3388,24 +3413,21 @@ class IEEngineWindow(QWidget):
         h.addWidget(badge)
         vbox.addWidget(bar)
 
-        # IE WebBrowser2 control
-        try:
-            self._ax = _QAxWidget()
-            self._ax.setControl(self._WB_CLSID)
-            vbox.addWidget(self._ax, stretch=1)
-
-            # Poll LocationURL / LocationName every 500 ms to keep toolbar in sync
-            self._poll = QTimer(self)
-            self._poll.timeout.connect(self._poll_location)
-            self._poll.start(500)
-
-        except Exception as exc:
+        if IE_AVAILABLE:
+            # Create embed widget — actual COM init is deferred until shown
+            self._embed = IEEmbedWidget(self)
+            self._embed.urlChanged.connect(self._on_url_changed)
+            self._embed.titleChanged.connect(self._on_title_changed)
+            vbox.addWidget(self._embed, stretch=1)
+            # Defer COM init so the native HWND is fully created first
+            QTimer.singleShot(0, self._init_embed)
+        else:
             lbl = QLabel(
-                "⚠  Motore IE non disponibile su questo sistema.\n\n"
-                f"{exc}\n\n"
-                "Assicurati che Internet Explorer sia abilitato:\n"
-                "Pannello di controllo → Programmi → "
-                "Attiva o disattiva funzionalità Windows → Internet Explorer 11"
+                f"⚠  Motore IE non disponibile.\n\n"
+                f"{IE_UNAVAILABLE_REASON}\n\n"
+                "Installa comtypes con:\n"
+                "   pip install comtypes\n\n"
+                "Poi riavvia CalNav."
             )
             lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
             lbl.setWordWrap(True)
@@ -3413,6 +3435,23 @@ class IEEngineWindow(QWidget):
                 f"color: {AMBER}; font-size: 13px; padding: 40px;"
             )
             vbox.addWidget(lbl)
+
+    def _init_embed(self):
+        """Called once after the widget HWND is created — starts COM hosting."""
+        if self._embed is None:
+            return
+        err = self._embed.init_browser()
+        if err:
+            from PyQt6.QtWidgets import QMessageBox
+            QMessageBox.critical(
+                self, "Motore IE — errore",
+                f"Impossibile inizializzare il motore IE:\n\n{err}\n\n"
+                "Verifica che MSHTML / Internet Explorer sia abilitato sul sistema.",
+            )
+            self._embed = None
+        elif self._pending_url:
+            self._embed.navigate(self._pending_url)
+            self._pending_url = ""
 
     @staticmethod
     def _nav_btn(text: str, tip: str) -> QPushButton:
@@ -3435,37 +3474,33 @@ class IEEngineWindow(QWidget):
         if not url.startswith(("http://", "https://", "file://")):
             url = "http://" + url
         self._addr.setText(url)
-        if self._ax:
-            self._ax.dynamicCall("Navigate(const QString&)", url)
+        if self._embed:
+            self._embed.navigate(url)
+        else:
+            self._pending_url = url
 
     def _on_addr_enter(self):
         self._navigate(self._addr.text().strip())
 
     def _go_back(self):
-        if self._ax:
-            self._ax.dynamicCall("GoBack()")
+        if self._embed:
+            self._embed.go_back()
 
     def _go_forward(self):
-        if self._ax:
-            self._ax.dynamicCall("GoForward()")
+        if self._embed:
+            self._embed.go_forward()
 
     def _go_refresh(self):
-        if self._ax:
-            self._ax.dynamicCall("Refresh()")
+        if self._embed:
+            self._embed.refresh()
 
-    def _poll_location(self):
-        """Keep address bar and title bar in sync with the current page."""
-        if not self._ax:
-            return
-        try:
-            url = self._ax.property("LocationURL") or ""
-            if url and url != self._addr.text():
-                self._addr.setText(url)
-            name = self._ax.property("LocationName") or url
-            if name:
-                self.setWindowTitle(f"ℯ IE — {name}")
-        except Exception:
-            pass
+    def _on_url_changed(self, url: str):
+        if url and url != self._addr.text():
+            self._addr.setText(url)
+
+    def _on_title_changed(self, title: str):
+        if title:
+            self.setWindowTitle(f"ℯ IE — {title}")
 
 
 # ── Main window ───────────────────────────────────────────────────────────────
@@ -3473,6 +3508,7 @@ class CalNavWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self._ie_mode = False
+        self._ie_windows: list = []   # keep IEEngineWindow refs alive (GC guard)
         self.setWindowTitle("CalNav")
         self.setMinimumSize(900, 600)
         self.resize(1280, 820)
@@ -3486,6 +3522,9 @@ class CalNavWindow(QMainWindow):
         self._media_states: dict = {}            # view -> {hasMedia, paused, ...}
         self._pip_window: Optional["CalNavPiPWindow"] = None  # floating mini-player
         self._pip_source_view: Optional[QWebEngineView] = None  # tab muted when PiP opened
+        # (host, username) pairs the user declined via "Non ora" this session —
+        # used to stop the save-password bar from re-appearing on refresh.
+        self._dismissed_creds: set = set()
 
         self._build_ui()   # builds tab widget + toolbar (no tabs yet)
 
@@ -3511,10 +3550,11 @@ class CalNavWindow(QMainWindow):
         self._update_profile_button()
         self._restore_session()   # opens tabs from saved session (or homepage)
 
-        # Controlla aggiornamenti 5 secondi dopo l'avvio
+        # Check for updates 30 s after startup (gives the app time to settle
+        # and avoids showing a notification immediately after an auto-update restart)
         self._updater = UpdateChecker(self)
         self._updater.update_available.connect(self._update_bar.show_update)
-        QTimer.singleShot(5000, self._updater.check)
+        QTimer.singleShot(30_000, self._updater.check)
 
     # ── Current tab accessor ──────────────────────────────────────────────────
     @property
@@ -3706,11 +3746,25 @@ class CalNavWindow(QMainWindow):
             self.statusBar().showMessage("Impostazioni salvate.", 3000)
 
     def _on_save_request(self, url: str, username: str, password: str):
+        # Don't re-prompt if this exact credential is already stored (the page
+        # was just refreshed / re-submitted with the same login).
+        for e in self.password_manager.get(url):
+            if e["username"] == username and e["password"] == password:
+                return
+        # Don't re-prompt for credentials the user dismissed this session.
+        if (_pw_host(url), username) in self._dismissed_creds:
+            return
         self._save_bar.offer(url, username, password)
 
     def _on_save_bar_saved(self, url: str, username: str, password: str):
         self.password_manager.save(url, username, password)
+        # Clear any prior dismissal so the saved entry is authoritative.
+        self._dismissed_creds.discard((_pw_host(url), username))
         self.statusBar().showMessage("Password salvata.", 3000)
+
+    def _on_save_bar_dismissed(self, url: str, username: str):
+        """Remember the 'Non ora' choice so we stop nagging this session."""
+        self._dismissed_creds.add((_pw_host(url), username))
 
     def _on_autofill_fill(self, username: str, password: str):
         """Inject saved credentials into the current page's login form."""
@@ -3934,13 +3988,10 @@ class CalNavWindow(QMainWindow):
 
     def _retheme(self):
         """Rebuild toolbar and re-style all persistent chrome widgets."""
-        from PyQt6.QtWidgets import QApplication as _QApp
-
-        # Update app-level QSS (menus, scrollbars, tooltips)
-        _QApp.instance().setStyleSheet(_global_qss())
-
-        # Main window background
-        self.setStyleSheet(f"QMainWindow {{ background: {NAVY_DEEP}; }}")
+        # Chrome QSS (menus, tooltips, chrome scrollbars) + window background,
+        # applied on the window only — never on QApplication, to keep it out of
+        # QtWebEngine's <select> popup / PiP overlay (see _global_qss).
+        self.setStyleSheet(_global_qss() + f"\nQMainWindow {{ background: {NAVY_DEEP}; }}")
 
         # Rebuild toolbar in-place
         vbox = self.centralWidget().layout()
@@ -4640,6 +4691,7 @@ class CalNavWindow(QMainWindow):
 
         self._save_bar = SavePasswordBar()
         self._save_bar.save_requested.connect(self._on_save_bar_saved)
+        self._save_bar.dismissed.connect(self._on_save_bar_dismissed)
         vbox.addWidget(self._save_bar)
 
         self._autofill_bar = AutofillBar()
@@ -4658,7 +4710,9 @@ class CalNavWindow(QMainWindow):
         vbox.addWidget(self._media_bar)
 
         self._build_status_bar()
-        self.setStyleSheet(f"QMainWindow {{ background: {NAVY_DEEP}; }}")
+        # Chrome QSS lives on the window, NOT on QApplication, so it cannot
+        # bleed into QtWebEngine's <select> popup / PiP overlay (see _global_qss).
+        self.setStyleSheet(_global_qss() + f"\nQMainWindow {{ background: {NAVY_DEEP}; }}")
 
     def _build_toolbar(self) -> QWidget:
         bar = QWidget()
@@ -4958,45 +5012,19 @@ class CalNavWindow(QMainWindow):
         menu.exec(self.btn_ie.mapToGlobal(pos))
 
     def _open_ie_engine_window(self, url: str = ""):
-        """Open current page (or given URL) in a real Trident/MSHTML window."""
-        # Re-try the import at call-time (covers cases where _AX_OK was False
-        # at startup but the module is actually present, e.g. Python 3.14 quirk)
-        ax_widget_cls = None
-        try:
-            from PyQt6.QAxContainer import QAxWidget as _AX
-            ax_widget_cls = _AX
-        except Exception as exc:
-            from PyQt6.QtWidgets import QMessageBox
-            QMessageBox.warning(
-                self, "Motore IE — modulo mancante",
-                "PyQt6.QAxContainer non è disponibile su questo sistema.\n\n"
-                f"Errore: {exc}\n\n"
-                "Prova a reinstallare PyQt6:\n"
-                "  pip install --upgrade PyQt6",
-            )
-            return
+        """Open the current page embedded in the real IE/MSHTML engine (ActiveX)."""
+        url = url or (self.webview.url().toString() if self.webview else "")
+        if not url or url == "about:blank":
+            url = ""
 
-        if not url:
-            url = self.webview.url().toString() if self.webview else ""
-        url = url or "about:blank"
-
-        # Build window using the freshly-imported class
-        try:
-            win = IEEngineWindow.__new__(IEEngineWindow)
-            IEEngineWindow.__init__(win, url)
-        except Exception as exc:
-            from PyQt6.QtWidgets import QMessageBox
-            QMessageBox.critical(self, "Motore IE — errore", str(exc))
-            return
-
-        # Keep a Python reference so GC doesn't destroy the window
-        if not hasattr(self, "_ie_windows"):
-            self._ie_windows = []
+        win = IEEngineWindow(url)
         self._ie_windows.append(win)
-        win.destroyed.connect(lambda: self._ie_windows.remove(win)
-                              if win in self._ie_windows else None)
+        # Remove from list when closed so we don't accumulate stale references
+        win.destroyed.connect(
+            lambda: self._ie_windows.remove(win)
+            if win in self._ie_windows else None
+        )
         win.show()
-        win.raise_()
 
     # ── Navigazione ───────────────────────────────────────────────────────────
     def _load_in_view(self, view: QWebEngineView, url: str):
@@ -5195,7 +5223,6 @@ def main():
     app.setStyle("Fusion")
 
     win = CalNavWindow()
-    app.setStyleSheet(_global_qss())
     win.show()
     sys.exit(app.exec())
 
