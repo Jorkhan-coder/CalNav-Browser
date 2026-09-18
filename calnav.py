@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """CalNav Browser — Modern spirit, classic roots."""
 
-__version__ = "1.1.28-alpha"
+__version__ = "1.1.29-alpha"
 
 # Bumped ONLY when the frozen build's runtime dependencies change (PyQt6 /
 # PyQt6-WebEngine version, or the vendor/ payloads — WebView2Loader.dll,
@@ -27,7 +27,7 @@ from PyQt6.QtWidgets import (
     QHeaderView, QScrollArea, QMessageBox,
     QTabWidget, QTabBar, QMenu, QColorDialog, QInputDialog, QSlider,
     QSplitter, QListWidget, QListWidgetItem, QCheckBox, QComboBox,
-    QSpinBox, QFormLayout,
+    QSpinBox, QFormLayout, QFileDialog, QStackedWidget,
 )
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWebEngineCore import (
@@ -37,6 +37,7 @@ from PyQt6.QtWebChannel import QWebChannel
 from PyQt6.QtCore import (
     QUrl, Qt, QObject, pyqtSlot, pyqtSignal, QFile, QIODevice,
     PYQT_VERSION_STR, QT_VERSION_STR, QTimer, QRect, QSize, QProcess,
+    QStandardPaths,
 )
 from PyQt6.QtGui import QFont, QIcon, QKeySequence, QShortcut, QPainter, QColor
 from PyQt6.QtNetwork import QNetworkAccessManager, QNetworkRequest
@@ -61,7 +62,15 @@ GITHUB_RELEASES_URL = (
     "https://github.com/Jorkhan-coder/CalNav-Browser/releases/latest"
 )
 _SETTINGS_FILE = DATA_DIR / "settings.json"
-_SETTINGS_DEFAULTS = {"homepage": HOME_URL, "theme": "dark"}
+# "" (empty) means "use the OS default Downloads folder" — resolved live via
+# _default_download_dir() rather than baked in, so it tracks the OS setting
+# if the user ever moves their Downloads folder.
+_SETTINGS_DEFAULTS = {"homepage": HOME_URL, "theme": "dark", "download_dir": ""}
+
+
+def _default_download_dir() -> str:
+    path = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DownloadLocation)
+    return path or str(Path.home() / "Downloads")
 
 
 def _load_settings() -> dict:
@@ -2781,6 +2790,84 @@ class CalNavMediaBar(QWidget):
 # ── Update notification bar ──────────────────────────────────────────────────
 _GITHUB_PKG = "git+https://github.com/Jorkhan-coder/CalNav-Browser.git"
 
+# Hostnames known to require codecs (H.264/AAC) that QtWebEngine's build
+# doesn't ship — the video works instead in the real Edge/WebView2 engine
+# (see WebView2EngineWindow). Add more here as they come up.
+CODEC_BLOCKED_HOSTS = ("twitch.tv",)
+
+
+def _host_needs_real_engine(host: str) -> bool:
+    host = (host or "").lower()
+    return any(host == h or host.endswith("." + h) for h in CODEC_BLOCKED_HOSTS)
+
+
+class CodecEngineBar(QWidget):
+    """Notification bar shown when the current tab is on a site (Twitch…)
+    whose video needs codecs this app's QtWebEngine build doesn't have —
+    offers to reopen the page in the real Edge (WebView2) engine instead."""
+
+    open_edge_requested = pyqtSignal()
+    dismissed = pyqtSignal(str)   # host that was dismissed
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._host = ""
+        self._build()
+        self.hide()
+
+    def _build(self):
+        self.setFixedHeight(40)
+        self.setStyleSheet(f"background: #2A2000; border-bottom: 1px solid {AMBER};")
+        h = QHBoxLayout(self)
+        h.setContentsMargins(18, 0, 18, 0)
+        h.setSpacing(12)
+
+        icon = QLabel("⚠")
+        icon.setStyleSheet("font-size: 14px;")
+        h.addWidget(icon)
+
+        self._msg = QLabel()
+        self._msg.setStyleSheet(f"color: {TEXT_BRIGHT}; font-size: 12px;")
+        h.addWidget(self._msg, stretch=1)
+
+        btn_open = QPushButton("Apri con Edge")
+        btn_open.setFixedSize(120, 28)
+        btn_open.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_open.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
+        btn_open.setStyleSheet(f"""
+            QPushButton {{ background: {AMBER}; color: {NAVY_DEEP}; border: none; border-radius: 6px; }}
+            QPushButton:hover {{ background: #FFD666; }}
+        """)
+        btn_open.clicked.connect(self.open_edge_requested.emit)
+        h.addWidget(btn_open)
+
+        btn_x = QPushButton("✕")
+        btn_x.setFixedSize(28, 28)
+        btn_x.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_x.setStyleSheet(f"""
+            QPushButton {{ background: transparent; color: {TEXT_DIM}; border: none;
+                font-size: 11px; border-radius: 5px; }}
+            QPushButton:hover {{ color: {TEXT_BRIGHT}; }}
+        """)
+        btn_x.clicked.connect(self._on_dismiss)
+        h.addWidget(btn_x)
+
+    def _on_dismiss(self):
+        self.hide()
+        self.dismissed.emit(self._host)
+
+    def show_for_host(self, host: str):
+        self._host = host
+        self._msg.setText(
+            f"«{host}» potrebbe non riprodurre i video (mancano i codec H.264) "
+            "— prova il motore Edge reale."
+        )
+        self.show()
+
+    def retheme(self):
+        self._msg.setStyleSheet(f"color: {TEXT_BRIGHT}; font-size: 12px;")
+
+
 class UpdateBar(QWidget):
     """Notification bar: detects new version and auto-installs it via pip."""
 
@@ -3188,61 +3275,211 @@ class UpdateChecker(QObject):
 
 # ── Settings dialog ───────────────────────────────────────────────────────────
 class SettingsDialog(QDialog):
+    """Categorized settings — a sidebar of sections + a detail pane on the
+    right, the same layout every mainstream browser uses, so each setting
+    lives somewhere predictable instead of one long scrolling list."""
+
+    _CATEGORIES = ["Generale", "Download", "Informazioni"]
+
     def __init__(self, settings: dict, parent=None):
         super().__init__(parent)
         self._settings = dict(settings)
         self.setWindowTitle("Impostazioni — CalNav")
-        self.setFixedSize(520, 440)
+        self.setMinimumSize(680, 460)
+        self.resize(680, 460)
         self._build()
 
     def _build(self):
         self.setStyleSheet(f"background: {NAVY_MID}; color: {TEXT_BRIGHT};")
-        vbox = QVBoxLayout(self)
-        vbox.setContentsMargins(28, 24, 28, 16)
-        vbox.setSpacing(0)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
 
-        # Title
         hdr = QLabel("Impostazioni")
         hdr.setFont(QFont("Segoe UI", 15, QFont.Weight.Bold))
-        hdr.setStyleSheet(f"color: {TEAL}; margin-bottom: 18px;")
-        vbox.addWidget(hdr)
+        hdr.setStyleSheet(f"color: {TEAL}; padding: 20px 24px 12px 24px;")
+        outer.addWidget(hdr)
 
-        # ── Navigazione ──────────────────────────────────────────────────────
-        self._add_section(vbox, "Navigazione")
+        body = QHBoxLayout()
+        body.setContentsMargins(0, 0, 0, 0)
+        body.setSpacing(0)
 
-        row_home = QHBoxLayout()
-        lbl = QLabel("Homepage:")
-        lbl.setFixedWidth(110)
-        lbl.setStyleSheet(f"color: {TEXT_BRIGHT}; font-size: 13px;")
-        row_home.addWidget(lbl)
+        # ── Sidebar ────────────────────────────────────────────────────────
+        self._sidebar = QListWidget()
+        self._sidebar.setFixedWidth(170)
+        self._sidebar.setStyleSheet(f"""
+            QListWidget {{
+                background: {NAVY_DEEP}; border: none;
+                border-top: 1px solid #253852; padding: 8px 0;
+                outline: none;
+            }}
+            QListWidget::item {{
+                padding: 10px 20px; color: {TEXT_DIM}; font-size: 13px;
+                border-left: 3px solid transparent;
+            }}
+            QListWidget::item:selected {{
+                background: rgba(0,212,255,0.12); color: {TEAL};
+                border-left: 3px solid {TEAL};
+            }}
+            QListWidget::item:hover:!selected {{ color: {TEXT_BRIGHT}; }}
+        """)
+        for label in self._CATEGORIES:
+            self._sidebar.addItem(label)
+        self._sidebar.currentRowChanged.connect(self._on_category_changed)
+        body.addWidget(self._sidebar)
 
-        self._home_edit = QLineEdit(self._settings.get("homepage", HOME_URL))
-        self._home_edit.setFixedHeight(34)
-        self._home_edit.setStyleSheet(f"""
+        div = QWidget()
+        div.setFixedWidth(1)
+        div.setStyleSheet("background: #253852;")
+        body.addWidget(div)
+
+        # ── Pages ────────────────────────────────────────────────────────
+        self._pages = QStackedWidget()
+        self._pages.addWidget(self._build_general_page())
+        self._pages.addWidget(self._build_download_page())
+        self._pages.addWidget(self._build_info_page())
+        body.addWidget(self._pages, stretch=1)
+
+        outer.addLayout(body, stretch=1)
+
+        # ── Bottom buttons ───────────────────────────────────────────────
+        bottom = QHBoxLayout()
+        bottom.setContentsMargins(24, 14, 24, 20)
+        bottom.addStretch()
+
+        btn_cancel = QPushButton("Annulla")
+        btn_cancel.setFixedHeight(36)
+        btn_cancel.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_cancel.setStyleSheet(f"""
+            QPushButton {{ background: transparent; color: {TEXT_DIM}; border: 1px solid #253852; border-radius: 8px; padding: 0 20px; }}
+            QPushButton:hover {{ color: {TEXT_BRIGHT}; border-color: {TEAL_DIM}; }}
+        """)
+        btn_cancel.clicked.connect(self.reject)
+        bottom.addWidget(btn_cancel)
+
+        btn_save = QPushButton("Salva")
+        btn_save.setFixedHeight(36)
+        btn_save.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_save.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
+        btn_save.setStyleSheet(f"""
+            QPushButton {{ background: {TEAL}; color: {NAVY_DEEP}; border: none; border-radius: 8px; padding: 0 24px; }}
+            QPushButton:hover {{ background: #33DDFF; }}
+        """)
+        btn_save.clicked.connect(self._on_save)
+        bottom.addWidget(btn_save)
+        outer.addLayout(bottom)
+
+        self._sidebar.setCurrentRow(0)
+
+    def _on_category_changed(self, row: int):
+        if row >= 0:
+            self._pages.setCurrentIndex(row)
+
+    # ── Page helpers ─────────────────────────────────────────────────────
+
+    @staticmethod
+    def _page(title: str) -> tuple[QWidget, QVBoxLayout]:
+        page = QWidget()
+        vbox = QVBoxLayout(page)
+        vbox.setContentsMargins(28, 24, 28, 20)
+        vbox.setSpacing(14)
+        lbl = QLabel(title)
+        lbl.setFont(QFont("Segoe UI", 12, QFont.Weight.Bold))
+        lbl.setStyleSheet(f"color: {TEXT_BRIGHT};")
+        vbox.addWidget(lbl)
+        return page, vbox
+
+    def _field_style(self) -> str:
+        return f"""
             QLineEdit {{
                 background: {NAVY_LIGHT}; color: {TEXT_BRIGHT};
                 border: 1.5px solid #253852; border-radius: 8px;
                 padding: 0 12px; font-size: 13px;
             }}
             QLineEdit:focus {{ border-color: {TEAL}; }}
-        """)
+        """
+
+    def _secondary_btn_style(self) -> str:
+        return f"""
+            QPushButton {{ background: rgba(0,212,255,0.12); color: {TEAL}; border: 1px solid {TEAL_DIM}; border-radius: 8px; padding: 0 10px; font-size: 11px; }}
+            QPushButton:hover {{ background: rgba(0,212,255,0.22); }}
+        """
+
+    # ── Generale ─────────────────────────────────────────────────────────
+
+    def _build_general_page(self) -> QWidget:
+        page, vbox = self._page("Generale")
+
+        lbl = QLabel("Homepage")
+        lbl.setStyleSheet(f"color: {TEXT_DIM}; font-size: 11px;")
+        vbox.addWidget(lbl)
+
+        row_home = QHBoxLayout()
+        self._home_edit = QLineEdit(self._settings.get("homepage", HOME_URL))
+        self._home_edit.setFixedHeight(34)
+        self._home_edit.setStyleSheet(self._field_style())
         row_home.addWidget(self._home_edit, stretch=1)
 
         btn_cur = QPushButton("Usa pagina attuale")
         btn_cur.setFixedHeight(34)
         btn_cur.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn_cur.setStyleSheet(f"""
-            QPushButton {{ background: rgba(0,212,255,0.12); color: {TEAL}; border: 1px solid {TEAL_DIM}; border-radius: 8px; padding: 0 10px; font-size: 11px; }}
-            QPushButton:hover {{ background: rgba(0,212,255,0.22); }}
-        """)
+        btn_cur.setStyleSheet(self._secondary_btn_style())
         btn_cur.clicked.connect(self._use_current_url)
         row_home.addWidget(btn_cur)
         vbox.addLayout(row_home)
 
-        vbox.addSpacing(20)
+        vbox.addStretch()
+        return page
 
-        # ── Informazioni ─────────────────────────────────────────────────────
-        self._add_section(vbox, "Informazioni")
+    def _use_current_url(self):
+        parent = self.parent()
+        if parent and hasattr(parent, "address_bar"):
+            url = parent.address_bar.text().strip()
+            if url:
+                self._home_edit.setText(url)
+
+    # ── Download ─────────────────────────────────────────────────────────
+
+    def _build_download_page(self) -> QWidget:
+        page, vbox = self._page("Download")
+
+        lbl = QLabel("Cartella di salvataggio")
+        lbl.setStyleSheet(f"color: {TEXT_DIM}; font-size: 11px;")
+        vbox.addWidget(lbl)
+
+        row = QHBoxLayout()
+        current = self._settings.get("download_dir") or _default_download_dir()
+        self._download_dir_edit = QLineEdit(current)
+        self._download_dir_edit.setFixedHeight(34)
+        self._download_dir_edit.setStyleSheet(self._field_style())
+        row.addWidget(self._download_dir_edit, stretch=1)
+
+        btn_browse = QPushButton("Sfoglia…")
+        btn_browse.setFixedHeight(34)
+        btn_browse.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_browse.setStyleSheet(self._secondary_btn_style())
+        btn_browse.clicked.connect(self._browse_download_dir)
+        row.addWidget(btn_browse)
+        vbox.addLayout(row)
+
+        hint = QLabel(f"Predefinita: {_default_download_dir()}")
+        hint.setStyleSheet(f"color: {TEXT_DIM}; font-size: 11px;")
+        hint.setWordWrap(True)
+        vbox.addWidget(hint)
+
+        vbox.addStretch()
+        return page
+
+    def _browse_download_dir(self):
+        start = self._download_dir_edit.text().strip() or _default_download_dir()
+        chosen = QFileDialog.getExistingDirectory(self, "Scegli cartella di salvataggio", start)
+        if chosen:
+            self._download_dir_edit.setText(chosen)
+
+    # ── Informazioni ─────────────────────────────────────────────────────
+
+    def _build_info_page(self) -> QWidget:
+        page, vbox = self._page("Informazioni")
 
         try:
             from PyQt6.QtWebEngineCore import qWebEngineChromiumVersion
@@ -3274,56 +3511,23 @@ class SettingsDialog(QDialog):
             lbl_v.setStyleSheet("font-size: 12px;")
             row.addWidget(lbl_v, stretch=1)
             vbox.addLayout(row)
-            vbox.addSpacing(4)
 
         vbox.addStretch()
+        return page
 
-        # Bottom buttons
-        bottom = QHBoxLayout()
-        bottom.addStretch()
-
-        btn_cancel = QPushButton("Annulla")
-        btn_cancel.setFixedHeight(36)
-        btn_cancel.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn_cancel.setStyleSheet(f"""
-            QPushButton {{ background: transparent; color: {TEXT_DIM}; border: 1px solid #253852; border-radius: 8px; padding: 0 20px; }}
-            QPushButton:hover {{ color: {TEXT_BRIGHT}; border-color: {TEAL_DIM}; }}
-        """)
-        btn_cancel.clicked.connect(self.reject)
-        bottom.addWidget(btn_cancel)
-
-        btn_save = QPushButton("Salva")
-        btn_save.setFixedHeight(36)
-        btn_save.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn_save.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
-        btn_save.setStyleSheet(f"""
-            QPushButton {{ background: {TEAL}; color: {NAVY_DEEP}; border: none; border-radius: 8px; padding: 0 24px; }}
-            QPushButton:hover {{ background: #33DDFF; }}
-        """)
-        btn_save.clicked.connect(self._on_save)
-        bottom.addWidget(btn_save)
-        vbox.addLayout(bottom)
-
-    def _add_section(self, layout, title: str):
-        lbl = QLabel(title.upper())
-        lbl.setStyleSheet(
-            f"color: {TEXT_DIM}; font-size: 10px; letter-spacing: 2px; "
-            f"font-weight: bold; margin-bottom: 8px;"
-        )
-        layout.addWidget(lbl)
-
-    def _use_current_url(self):
-        parent = self.parent()
-        if parent and hasattr(parent, "address_bar"):
-            url = parent.address_bar.text().strip()
-            if url:
-                self._home_edit.setText(url)
+    # ── Save ─────────────────────────────────────────────────────────────
 
     def _on_save(self):
         url = self._home_edit.text().strip()
         if url and not url.startswith(("http://", "https://")):
             url = "https://" + url
         self._settings["homepage"] = url or HOME_URL
+
+        download_dir = self._download_dir_edit.text().strip()
+        if download_dir == _default_download_dir():
+            download_dir = ""   # keep tracking the OS default rather than freezing it
+        self._settings["download_dir"] = download_dir
+
         self.accept()
 
     def get_settings(self) -> dict:
@@ -4030,6 +4234,56 @@ class WebView2EngineWindow(QWidget):
         super().closeEvent(event)
 
 
+# ── Browser view (page-level right-click menu) ────────────────────────────────
+class BrowserView(QWebEngineView):
+    """QWebEngineView with its own right-click menu.
+
+    QtWebEngine's *default* context menu policy shows a native Chromium menu,
+    but this Qt/PyQt6 version exposes no way to inspect what was clicked
+    (contextMenuData()/contextMenuRequested aren't available here) or to add
+    our own entries to it — so we override contextMenuEvent and build an
+    equivalent menu ourselves from QWebEnginePage's own WebActions (Chromium
+    keeps them correctly enabled/disabled), plus "Stampa pagina".
+    """
+
+    printRequested = pyqtSignal()
+
+    def _build_context_menu(self) -> "QMenu | None":
+        page = self.page()
+        if page is None:
+            return None
+        WA = QWebEnginePage.WebAction
+        menu = QMenu(self)
+        menu.setStyleSheet(f"""
+            QMenu {{
+                background: {NAVY_MID}; color: {TEXT_BRIGHT};
+                border: 1px solid #253852; border-radius: 8px; padding: 4px;
+            }}
+            QMenu::item {{ padding: 6px 20px 6px 12px; border-radius: 5px; }}
+            QMenu::item:selected {{ background: rgba(0,212,255,0.15); color: {TEAL}; }}
+            QMenu::separator {{ height: 1px; background: #253852; margin: 4px 8px; }}
+        """)
+        menu.addAction(page.action(WA.Back))
+        menu.addAction(page.action(WA.Forward))
+        menu.addAction(page.action(WA.Reload))
+        menu.addSeparator()
+        menu.addAction(page.action(WA.Copy))
+        menu.addAction(page.action(WA.SelectAll))
+        menu.addSeparator()
+        act_print = menu.addAction("🖨  Stampa pagina  Ctrl+P")
+        act_print.triggered.connect(self.printRequested.emit)
+        menu.addAction(page.action(WA.SavePage))
+        menu.addSeparator()
+        menu.addAction(page.action(WA.ViewSource))
+        menu.addAction(page.action(WA.InspectElement))
+        return menu
+
+    def contextMenuEvent(self, event):
+        menu = self._build_context_menu()
+        if menu is not None:
+            menu.exec(event.globalPos())
+
+
 # ── Main window ───────────────────────────────────────────────────────────────
 class CalNavWindow(QMainWindow):
     def __init__(self):
@@ -4052,6 +4306,9 @@ class CalNavWindow(QMainWindow):
         # (host, username) pairs the user declined via "Non ora" this session —
         # used to stop the save-password bar from re-appearing on refresh.
         self._dismissed_creds: set = set()
+        # Hosts for which the user dismissed the "needs the real Edge engine"
+        # bar this session — don't nag again while it stays the active tab.
+        self._dismissed_codec_hosts: set = set()
 
         self._build_ui()   # builds tab widget + toolbar (no tabs yet)
 
@@ -4111,6 +4368,7 @@ class CalNavWindow(QMainWindow):
     def _apply_profile_settings(self):
         p = self._web_profile
         p.setHttpUserAgent(IE_UA if self._ie_mode else self._build_chrome_ua())
+        p.downloadRequested.connect(self._on_download_requested)
 
         s = p.settings()
         s.setAttribute(QWebEngineSettings.WebAttribute.JavascriptEnabled, True)
@@ -4182,6 +4440,24 @@ class CalNavWindow(QMainWindow):
             shim.setInjectionPoint(QWebEngineScript.InjectionPoint.DocumentCreation)
             shim.setWorldId(QWebEngineScript.ScriptWorldId.MainWorld)
             scripts.insert(shim)
+
+    def _on_download_requested(self, download):
+        """Handle QWebEngineProfile.downloadRequested — without this, every
+        download silently does nothing: the native right-click "Salva
+        pagina", clicking a download link, "Save image as", etc. all fire
+        this signal, and Chromium just drops the download if nothing accepts
+        it."""
+        suggested = download.suggestedFileName() or "download"
+        download_dir = self._settings.get("download_dir") or _default_download_dir()
+        default_path = str(Path(download_dir) / suggested)
+        path, _filt = QFileDialog.getSaveFileName(self, "Salva file", default_path)
+        if not path:
+            download.cancel()
+            return
+        p = Path(path)
+        download.setDownloadDirectory(str(p.parent))
+        download.setDownloadFileName(p.name)
+        download.accept()
 
     def _update_profile_button(self):
         prof = self.profile_manager.current
@@ -4656,10 +4932,11 @@ class CalNavWindow(QMainWindow):
     def _new_tab(self, url: str = "", group_id: Optional[str] = None,
                  activate: bool = True) -> QWebEngineView:
         """Create a new tab with its own page, optionally in a group."""
-        view = QWebEngineView()
+        view = BrowserView()
         page = QWebEnginePage(self._web_profile, view)
         page.setWebChannel(self._channel)
         view.setPage(page)
+        view.printRequested.connect(lambda v=view: self._open_print_preview(v))
 
         # Connect signals
         view.urlChanged.connect(self._on_url_changed)
@@ -5307,6 +5584,12 @@ class CalNavWindow(QMainWindow):
         self._autofill_bar.fill_requested.connect(self._on_autofill_fill)
         vbox.addWidget(self._autofill_bar)
 
+        self._codec_bar = CodecEngineBar()
+        self._codec_bar.open_edge_requested.connect(
+            lambda: self._open_webview2_engine_window())
+        self._codec_bar.dismissed.connect(self._on_codec_bar_dismissed)
+        vbox.addWidget(self._codec_bar)
+
         vbox.addWidget(self._build_tab_widget(), stretch=1)
 
         # ── Persistent media control bar ─────────────────────────────────────
@@ -5649,6 +5932,10 @@ class CalNavWindow(QMainWindow):
             if win in self._ie_windows else None
         )
         win.show()
+        self._codec_bar.hide()
+
+    def _on_codec_bar_dismissed(self, host: str):
+        self._dismissed_codec_hosts.add(host)
 
     # ── Navigazione ───────────────────────────────────────────────────────────
     def _load_in_view(self, view: QWebEngineView, url: str):
@@ -5695,6 +5982,14 @@ class CalNavWindow(QMainWindow):
                 border-radius:4px; font-size:10px; font-weight:bold;
                 padding:1px 6px; margin:2px 4px;
             """)
+
+            # Sites needing codecs this engine doesn't have (Twitch…) — offer
+            # the real Edge/WebView2 engine instead of failing silently.
+            host = url.host()
+            if _host_needs_real_engine(host) and host not in self._dismissed_codec_hosts:
+                self._codec_bar.show_for_host(host)
+            else:
+                self._codec_bar.hide()
 
     def _on_load_progress(self, pct: int):
         if self.sender() is self.webview:
