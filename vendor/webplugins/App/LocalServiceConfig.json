@@ -1,0 +1,7 @@
+{
+    "LocalConfigPath": "WebPlugins",
+    "LocalPath": "PluginWeb",
+    "SingleInstance": "topo-web-component.lock",
+    "ServicePortStart": 34000,
+    "ServicePortEnd": 34009
+}

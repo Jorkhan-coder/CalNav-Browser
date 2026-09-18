@@ -95,12 +95,16 @@ def _host(url: str) -> str:
 class PasswordManager:
     def __init__(self, passwords_file: Path, profile_name: str):
         self._file = passwords_file
+        # Sidecar file holding hosts for which the user chose "don't ask again".
+        self._ignored_file = passwords_file.with_name(passwords_file.stem + "_ignored.dat")
         self._profile = profile_name
         self._fernet = None
         self._entries: List[Dict] = []
+        self._ignored_hosts: set = set()
         if _CRYPTO_OK:
             self._fernet = Fernet(_derive_key(profile_name))
         self._load()
+        self._load_ignored()
 
     # ── Persistence ───────────────────────────────────────────────────────────
 
@@ -123,6 +127,38 @@ class PasswordManager:
         raw = json.dumps(self._entries, ensure_ascii=False).encode()
         self._file.parent.mkdir(parents=True, exist_ok=True)
         self._file.write_bytes(self._fernet.encrypt(raw))
+
+    # ── "Don't ask again" hosts ────────────────────────────────────────────────
+
+    def _load_ignored(self):
+        if not self._ignored_file.exists() or not _CRYPTO_OK or not self._fernet:
+            return
+        try:
+            raw = self._fernet.decrypt(self._ignored_file.read_bytes())
+            self._ignored_hosts = set(json.loads(raw.decode()))
+        except Exception:
+            self._ignored_hosts = set()
+
+    def _save_ignored(self):
+        if not _CRYPTO_OK or not self._fernet:
+            return
+        raw = json.dumps(sorted(self._ignored_hosts), ensure_ascii=False).encode()
+        self._ignored_file.parent.mkdir(parents=True, exist_ok=True)
+        self._ignored_file.write_bytes(self._fernet.encrypt(raw))
+
+    def is_host_ignored(self, url: str) -> bool:
+        return _host(url) in self._ignored_hosts
+
+    def ignore_host(self, url: str):
+        """Remember not to offer saving passwords for this host again."""
+        self._ignored_hosts.add(_host(url))
+        self._save_ignored()
+
+    def unignore_host(self, url: str):
+        """Re-enable save offers for this host (e.g. after the user saves)."""
+        if _host(url) in self._ignored_hosts:
+            self._ignored_hosts.discard(_host(url))
+            self._save_ignored()
 
     # ── CRUD ──────────────────────────────────────────────────────────────────
 

@@ -547,7 +547,16 @@ if IE_AVAILABLE:
                 except Exception:
                     pass
 
-        def closeEvent(self, event):
+        def shutdown(self):
+            """Deactivate and release the WebBrowser2 control.
+
+            Must be called explicitly by the owning top-level window's
+            closeEvent — Qt does NOT send closeEvent to child widgets when
+            their parent window closes, so relying on this widget's own
+            closeEvent alone would leave the in-place-active ActiveX
+            control attached to a HWND that Qt is about to destroy
+            (WA_DeleteOnClose).
+            """
             if self._poll:
                 self._poll.stop()
                 self._poll = None
@@ -565,6 +574,9 @@ if IE_AVAILABLE:
                 self._ole = None
             self._host = None
             self._wb2  = None
+
+        def closeEvent(self, event):
+            self.shutdown()
             super().closeEvent(event)
 
 else:

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """CalNav Browser — Modern spirit, classic roots."""
 
-__version__ = "1.1.24-alpha"
+__version__ = "1.1.25-alpha"
 
 import json
 import os
@@ -33,9 +33,13 @@ from PyQt6.QtGui import QFont, QIcon, QKeySequence, QShortcut, QPainter, QColor
 from PyQt6.QtNetwork import QNetworkAccessManager, QNetworkRequest
 
 from calnav_ie_host import IEEmbedWidget, IE_AVAILABLE, IE_UNAVAILABLE_REASON
+from calnav_webview2_host import (
+    WebView2EmbedWidget, WEBVIEW2_AVAILABLE, WEBVIEW2_UNAVAILABLE_REASON,
+)
+import calnav_webplugins
 
 from calnav_profiles import ProfileManager, PROFILE_COLORS, DATA_DIR
-from calnav_passwords import PasswordManager, _host as _pw_host
+from calnav_passwords import PasswordManager
 from calnav_bookmarks import BookmarkManager, Bookmark, UNCATEGORIZED
 from calnav_session import TabGroup, SavedTab, SessionManager
 
@@ -3542,6 +3546,10 @@ class IEEngineWindow(QWidget):
         """Called once after the widget HWND is created — starts COM hosting."""
         if self._embed is None:
             return
+        # Servizio locale per il rendering video delle pagine di telecamere
+        # IP/NVR (Hikvision e OEM compatibili) — bundlato, nessuna
+        # installazione separata richiesta.
+        calnav_webplugins.ensure_running()
         err = self._embed.init_browser()
         if err:
             from PyQt6.QtWidgets import QMessageBox
@@ -3603,6 +3611,181 @@ class IEEngineWindow(QWidget):
     def _on_title_changed(self, title: str):
         if title:
             self.setWindowTitle(f"ℯ IE — {title}")
+
+    def closeEvent(self, event):
+        # Qt does not forward closeEvent to child widgets, so the embed's
+        # own closeEvent would never fire here — deactivate the ActiveX
+        # control explicitly before Qt destroys this window's native handle
+        # (WA_DeleteOnClose).
+        if self._embed:
+            self._embed.shutdown()
+        super().closeEvent(event)
+
+
+# ── WebView2 Engine Window (Edge/Chromium via comtypes — Windows only) ────────
+class WebView2EngineWindow(QWidget):
+    """Standalone window embedding real Microsoft Edge (WebView2).
+
+    Used for sites that need proprietary codecs (H.264/AAC) or DRM that the
+    app's main QtWebEngine build does not include — e.g. Twitch, which
+    otherwise fails with a generic playback error (#4000) even though the
+    page itself loads fine.
+    Requires: pip install comtypes  (+ WebView2 Runtime, preinstalled on
+    virtually all Windows 10/11 machines)
+    """
+
+    def __init__(self, url: str = "", parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        self.setWindowTitle("🌐 Motore Edge — CalNav")
+        self.resize(1100, 780)
+        self._embed: "WebView2EmbedWidget | None" = None
+        self._pending_url = url
+        self._build()
+
+    # ── UI ────────────────────────────────────────────────────────────────────
+
+    def _build(self):
+        vbox = QVBoxLayout(self)
+        vbox.setContentsMargins(0, 0, 0, 0)
+        vbox.setSpacing(0)
+
+        bar = QWidget()
+        bar.setFixedHeight(42)
+        bar.setStyleSheet(
+            f"background: {NAVY_MID}; border-bottom: 2px solid {TEAL};"
+        )
+        h = QHBoxLayout(bar)
+        h.setContentsMargins(8, 0, 8, 0)
+        h.setSpacing(4)
+
+        btn_back = self._nav_btn("←", "Indietro")
+        btn_back.clicked.connect(self._go_back)
+        h.addWidget(btn_back)
+
+        btn_fwd = self._nav_btn("→", "Avanti")
+        btn_fwd.clicked.connect(self._go_forward)
+        h.addWidget(btn_fwd)
+
+        btn_ref = self._nav_btn("↻", "Ricarica")
+        btn_ref.clicked.connect(self._go_refresh)
+        h.addWidget(btn_ref)
+
+        self._addr = QLineEdit()
+        self._addr.setFont(QFont("Segoe UI", 10))
+        self._addr.setStyleSheet(f"""
+            QLineEdit {{
+                background: {NAVY_LIGHT}; color: {TEXT_BRIGHT};
+                border: 1px solid {TEAL_DIM}; border-radius: 6px;
+                padding: 0 10px; height: 30px;
+            }}
+            QLineEdit:focus {{ border-color: {TEAL}; }}
+        """)
+        self._addr.returnPressed.connect(self._on_addr_enter)
+        h.addWidget(self._addr, stretch=1)
+
+        badge = QLabel("  🌐 Motore Edge reale (WebView2)  ")
+        badge.setStyleSheet(
+            f"color: {NAVY_DEEP}; background: {TEAL}; border-radius: 4px;"
+            f" font-size: 10px; font-weight: bold; padding: 2px 8px; margin: 0 4px;"
+        )
+        h.addWidget(badge)
+        vbox.addWidget(bar)
+
+        if WEBVIEW2_AVAILABLE:
+            self._embed = WebView2EmbedWidget(self)
+            self._embed.urlChanged.connect(self._on_url_changed)
+            self._embed.titleChanged.connect(self._on_title_changed)
+            vbox.addWidget(self._embed, stretch=1)
+            QTimer.singleShot(0, self._init_embed)
+        else:
+            lbl = QLabel(
+                f"⚠  Motore Edge (WebView2) non disponibile.\n\n"
+                f"{WEBVIEW2_UNAVAILABLE_REASON}\n\n"
+                "Installa comtypes con:\n"
+                "   pip install comtypes\n\n"
+                "Poi riavvia CalNav."
+            )
+            lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            lbl.setWordWrap(True)
+            lbl.setStyleSheet(
+                f"color: {AMBER}; font-size: 13px; padding: 40px;"
+            )
+            vbox.addWidget(lbl)
+
+    def _init_embed(self):
+        """Called once after the widget HWND is created — starts async COM init."""
+        if self._embed is None:
+            return
+        user_data_dir = str(DATA_DIR / "WebView2Data")
+        err = self._embed.init_browser(user_data_dir, pending_url=self._pending_url)
+        self._pending_url = ""
+        if err:
+            from PyQt6.QtWidgets import QMessageBox
+            QMessageBox.critical(
+                self, "Motore Edge — errore",
+                f"Impossibile inizializzare WebView2:\n\n{err}\n\n"
+                "Verifica che il WebView2 Runtime sia installato "
+                "(incluso di serie in Windows 10/11 con Edge aggiornato).",
+            )
+            self._embed = None
+
+    @staticmethod
+    def _nav_btn(text: str, tip: str) -> QPushButton:
+        b = QPushButton(text)
+        b.setFixedSize(32, 30)
+        b.setToolTip(tip)
+        b.setCursor(Qt.CursorShape.PointingHandCursor)
+        b.setFont(QFont("Segoe UI", 13))
+        b.setStyleSheet(f"""
+            QPushButton {{ background: transparent; color: {TEXT_BRIGHT};
+                border: none; border-radius: 5px; }}
+            QPushButton:hover {{ background: {BTN_HOVER}; }}
+            QPushButton:pressed {{ background: {BTN_PRESS}; }}
+        """)
+        return b
+
+    # ── Navigation ────────────────────────────────────────────────────────────
+
+    def _navigate(self, url: str):
+        if not url.startswith(("http://", "https://", "file://")):
+            url = "http://" + url
+        self._addr.setText(url)
+        if self._embed:
+            self._embed.navigate(url)
+        else:
+            self._pending_url = url
+
+    def _on_addr_enter(self):
+        self._navigate(self._addr.text().strip())
+
+    def _go_back(self):
+        if self._embed:
+            self._embed.go_back()
+
+    def _go_forward(self):
+        if self._embed:
+            self._embed.go_forward()
+
+    def _go_refresh(self):
+        if self._embed:
+            self._embed.refresh()
+
+    def _on_url_changed(self, url: str):
+        if url and url != self._addr.text():
+            self._addr.setText(url)
+
+    def _on_title_changed(self, title: str):
+        if title:
+            self.setWindowTitle(f"🌐 Edge — {title}")
+
+    def closeEvent(self, event):
+        # Qt does not forward closeEvent to child widgets, so the embed's
+        # own closeEvent would never fire here — drop our WebView2
+        # references explicitly (see WebView2EmbedWidget.shutdown).
+        if self._embed:
+            self._embed.shutdown()
+        super().closeEvent(event)
 
 
 # ── Main window ───────────────────────────────────────────────────────────────
@@ -3853,20 +4036,20 @@ class CalNavWindow(QMainWindow):
         for e in self.password_manager.get(url):
             if e["username"] == username and e["password"] == password:
                 return
-        # Don't re-prompt for credentials the user dismissed this session.
-        if (_pw_host(url), username) in self._dismissed_creds:
+        # Don't re-prompt for sites the user told us to stop asking about.
+        if self.password_manager.is_host_ignored(url):
             return
         self._save_bar.offer(url, username, password)
 
     def _on_save_bar_saved(self, url: str, username: str, password: str):
         self.password_manager.save(url, username, password)
-        # Clear any prior dismissal so the saved entry is authoritative.
-        self._dismissed_creds.discard((_pw_host(url), username))
+        # Saving overrides a prior "don't ask" for this host.
+        self.password_manager.unignore_host(url)
         self.statusBar().showMessage("Password salvata.", 3000)
 
     def _on_save_bar_dismissed(self, url: str, username: str):
-        """Remember the 'Non ora' choice so we stop nagging this session."""
-        self._dismissed_creds.add((_pw_host(url), username))
+        """Persist the dismissal so the save bar never returns for this host."""
+        self.password_manager.ignore_host(url)
 
     def _on_autofill_fill(self, username: str, password: str):
         """Inject saved credentials into the current page's login form."""
@@ -4885,7 +5068,7 @@ class CalNavWindow(QMainWindow):
         self.btn_ie.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
         self.btn_ie.setToolTip(
             "Clic: modalit\u00e0 UA IE11  Ctrl+I\n"
-            "Clic destro: apri con motore IE reale (ActiveX)"
+            "Clic destro: apri con motore IE reale o Edge/WebView2"
         )
         self.btn_ie.clicked.connect(self._toggle_ie_mode)
         self.btn_ie.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -5107,6 +5290,11 @@ class CalNavWindow(QMainWindow):
         act_real = menu.addAction("🔧  Apri con motore IE reale (ActiveX / HikVision…)")
         act_real.triggered.connect(self._open_ie_engine_window)  # always clickable
 
+        act_edge = menu.addAction(
+            "🌐  Apri con motore Edge reale (WebView2 — Twitch/Netflix/YouTube…)"
+        )
+        act_edge.triggered.connect(self._open_webview2_engine_window)
+
         menu.exec(self.btn_ie.mapToGlobal(pos))
 
     def _open_ie_engine_window(self, url: str = ""):
@@ -5118,6 +5306,21 @@ class CalNavWindow(QMainWindow):
         win = IEEngineWindow(url)
         self._ie_windows.append(win)
         # Remove from list when closed so we don't accumulate stale references
+        win.destroyed.connect(
+            lambda: self._ie_windows.remove(win)
+            if win in self._ie_windows else None
+        )
+        win.show()
+
+    def _open_webview2_engine_window(self, url: str = ""):
+        """Open the current page embedded in real Microsoft Edge (WebView2) —
+        for sites needing codecs/DRM the app's QtWebEngine build lacks."""
+        url = url or (self.webview.url().toString() if self.webview else "")
+        if not url or url == "about:blank":
+            url = ""
+
+        win = WebView2EngineWindow(url)
+        self._ie_windows.append(win)
         win.destroyed.connect(
             lambda: self._ie_windows.remove(win)
             if win in self._ie_windows else None

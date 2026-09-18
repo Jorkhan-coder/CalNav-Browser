@@ -22,3 +22,6 @@ PyQt6-WebEngine>=6.4.0
 
 # Password encryption (optional — app runs without it, passwords are disabled)
 cryptography>=41.0.0
+
+# COM interop for the real IE (MSHTML) and WebView2 (Edge) engines — Windows only
+comtypes>=1.2.0; sys_platform == "win32"

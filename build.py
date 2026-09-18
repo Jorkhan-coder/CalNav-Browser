@@ -21,11 +21,13 @@ if hasattr(sys.stdout, "reconfigure"):
 # -- Configurazione ------------------------------------------------------------
 ROOT        = Path(__file__).parent.resolve()
 APP_NAME    = "CalNav"
-APP_VERSION = "1.1.24-alpha"
+APP_VERSION = "1.1.25-alpha"
 ICON_FILE   = ROOT / "logo_browser.ico"
 DIST_DIR    = ROOT / "dist"
 BUILD_DIR   = ROOT / "build"
 RELEASE_DIR = ROOT / "release"
+WEBPLUGINS_DIR = ROOT / "vendor" / "webplugins"
+WEBVIEW2_DIR   = ROOT / "vendor" / "webview2"
 
 INNO_SETUP_PATHS = [
     Path(r"C:\Program Files (x86)\Inno Setup 6\ISCC.exe"),
@@ -148,7 +150,21 @@ def build_exe():
         "--distpath",    str(fresh_dist),
         "--workpath",    str(BUILD_DIR),
         "--add-data",    f"{ICON_FILE};.",
+    ]
 
+    if (WEBPLUGINS_DIR / "App" / "WebPluginService.exe").exists():
+        cmd += ["--add-data", f"{WEBPLUGINS_DIR};webplugins"]
+    else:
+        log("[!]  vendor/webplugins/App non trovato — CalNav verra' buildato"
+            " senza il servizio video per telecamere IP/NVR nel motore IE.")
+
+    if (WEBVIEW2_DIR / "WebView2Loader.dll").exists():
+        cmd += ["--add-data", f"{WEBVIEW2_DIR};webview2"]
+    else:
+        log("[!]  vendor/webview2/WebView2Loader.dll non trovato — il motore"
+            " Edge (Twitch/Netflix/YouTube) non sara' disponibile nel build.")
+
+    cmd += [
         # Solo i moduli effettivamente usati — i hook PyInstaller
         # includono automaticamente QtWebEngineProcess.exe e i .pak
         "--hidden-import", "PyQt6.QtWebEngineWidgets",
