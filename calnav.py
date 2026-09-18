@@ -70,6 +70,14 @@ def _save_settings(s: dict):
         json.dumps(s, ensure_ascii=False, indent=2), encoding="utf-8"
     )
 
+
+def _os_remove_quiet(path: str):
+    """Delete a file, ignoring errors (e.g. a partially-downloaded installer)."""
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
 # User-agent: byte-for-byte identical to Chrome 124 on Windows 10 x64.
 # Deliberately no "CalNav" token — Twitch, Netflix and other streaming CDNs
 # do exact-suffix checks like /Safari\/537\.36$/ and reject any extra tokens.
@@ -2774,6 +2782,7 @@ class UpdateBar(QWidget):
         self._installer_path = ""
         self._dl_nam = None
         self._dl_reply = None
+        self._installer_file = None
         self._build()
         self.hide()
 
@@ -2893,26 +2902,41 @@ class UpdateBar(QWidget):
             QNetworkRequest.Attribute.RedirectPolicyAttribute,
             QNetworkRequest.RedirectPolicy.NoLessSafeRedirectPolicy,
         )
+        # Qt's HTTP/2 stack has a known bug that aborts large downloads
+        # partway through with "HTTP/2 protocol error" — force HTTP/1.1 for
+        # this request (GitHub's CDN serves that fine).
+        req.setAttribute(QNetworkRequest.Attribute.Http2AllowedAttribute, False)
+
+        try:
+            self._installer_file = open(self._installer_path, "wb")
+        except OSError as e:
+            self._set_error(f"❌  Salvataggio fallito: {str(e)[:80]}")
+            return
+
         self._dl_reply = self._dl_nam.get(req)
         self._dl_reply.downloadProgress.connect(self._on_dl_progress)
+        self._dl_reply.readyRead.connect(self._on_dl_ready_read)
         self._dl_reply.finished.connect(self._on_dl_finished)
 
     def _on_dl_progress(self, received: int, total: int):
         if total > 0:
             self._set_busy(f"⏳  Download aggiornamento…  {received * 100 // total}%")
 
+    def _on_dl_ready_read(self):
+        # Stream to disk incrementally instead of buffering the whole
+        # installer (100+ MB) in memory until the transfer completes.
+        try:
+            self._installer_file.write(bytes(self._dl_reply.readAll()))
+        except OSError as e:
+            self._set_error(f"❌  Salvataggio fallito: {str(e)[:80]}")
+
     def _on_dl_finished(self):
         from PyQt6.QtNetwork import QNetworkReply
         reply, self._dl_reply = self._dl_reply, None
+        self._installer_file.close()
         if reply.error() != QNetworkReply.NetworkError.NoError:
             self._set_error(f"❌  Download fallito: {reply.errorString()[:80]}")
-            reply.deleteLater()
-            return
-        try:
-            with open(self._installer_path, "wb") as f:
-                f.write(bytes(reply.readAll()))
-        except OSError as e:
-            self._set_error(f"❌  Salvataggio fallito: {str(e)[:80]}")
+            _os_remove_quiet(self._installer_path)
             reply.deleteLater()
             return
         reply.deleteLater()
