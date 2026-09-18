@@ -33,6 +33,7 @@ jobs:
             PyQt6-WebEngine `
             cryptography `
             comtypes `
+            pikepdf `
             pyinstaller `
             pillow
 

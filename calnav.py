@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """CalNav Browser — Modern spirit, classic roots."""
 
-__version__ = "1.1.26-alpha"
+__version__ = "1.1.27-alpha"
 
 import json
+import math
 import os
 import re
 import sys
+import time
 from pathlib import Path
 
 from typing import List, Optional
@@ -36,6 +38,7 @@ from calnav_ie_host import IEEmbedWidget, IE_AVAILABLE, IE_UNAVAILABLE_REASON
 from calnav_webview2_host import (
     WebView2EmbedWidget, WEBVIEW2_AVAILABLE, WEBVIEW2_UNAVAILABLE_REASON,
 )
+from calnav_print import PrintPreviewDialog
 import calnav_webplugins
 
 from calnav_profiles import ProfileManager, PROFILE_COLORS, DATA_DIR
@@ -3224,11 +3227,19 @@ class CalNavTabBar(QTabBar):
     # Emits after a drag-and-drop reorder is FULLY COMPLETE (mouse released).
     # Safe moment to call removeTab/insertTab without corrupting Qt's drag state.
     tabs_reordered = pyqtSignal()
+    # Emits on mouse release when the user paused a drag long enough over a
+    # neighbouring tab to signal "group these two" (dragged_index, target_index).
+    group_drop_requested = pyqtSignal(int, int)
 
     # tabData prefix for group-header "linguetta" tabs
     _HEADER_PREFIX = "__hdr__"
     # tabData sentinel for the "+" pseudo-tab
     _PLUS_DATA = "__plus__"
+
+    # How long (ms) a drag must "settle" next to a neighbour before it's
+    # offered as a group-drop target — long enough to not trigger by accident
+    # while just passing through, short enough to feel responsive.
+    _DWELL_MS = 380
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -3241,6 +3252,16 @@ class CalNavTabBar(QTabBar):
         self.setElideMode(Qt.TextElideMode.ElideRight)
         self.setExpanding(False)
 
+        # ── Drag-to-group ("pause over a neighbour tab") state ────────────────
+        self._dwell_neighbor: Optional[int] = None   # neighbour index we're timing
+        self._group_hover_index: Optional[int] = None  # neighbour offered as a drop target
+        self._dwell_timer = QTimer(self)
+        self._dwell_timer.setSingleShot(True)
+        self._dwell_timer.timeout.connect(self._on_dwell_elapsed)
+        self._pulse_timer = QTimer(self)
+        self._pulse_timer.setInterval(40)
+        self._pulse_timer.timeout.connect(self.update)
+
     def set_color_resolver(self, fn):
         self._color_resolver = fn
 
@@ -3251,6 +3272,43 @@ class CalNavTabBar(QTabBar):
     def _on_tab_moved_internal(self, _from: int, _to: int):
         """Record that a drag-reorder happened; actual rebuild waits for mouseRelease."""
         self._drag_in_progress = True
+        # The reorder just changed which tab is adjacent — any dwell-in-progress
+        # is now pointing at a stale neighbour, restart the countdown.
+        self._reset_dwell()
+
+    # ── Drag-to-group ─────────────────────────────────────────────────────────
+
+    def _reset_dwell(self):
+        self._dwell_timer.stop()
+        self._dwell_neighbor = None
+        if self._group_hover_index is not None:
+            self._group_hover_index = None
+            self._pulse_timer.stop()
+            self.update()
+
+    def _on_dwell_elapsed(self):
+        if self._dwell_neighbor is not None:
+            self._group_hover_index = self._dwell_neighbor
+            self._pulse_timer.start()
+            self.update()
+
+    def _draggable_neighbor_at(self, pos) -> Optional[int]:
+        """Return the index of the tab immediately beside the one currently
+        under the cursor — on whichever side the cursor is biased towards —
+        or None if there isn't a valid grouping candidate there."""
+        idx = self.tabAt(pos)
+        if idx < 0:
+            return None
+        rect = self.tabRect(idx)
+        # Left half of the dragged tab → its left neighbour is the candidate;
+        # right half → its right neighbour.
+        neighbor = idx - 1 if (pos.x() - rect.x()) < rect.width() / 2 else idx + 1
+        if neighbor < 0 or neighbor >= self.count() or neighbor == idx:
+            return None
+        data = self.tabData(neighbor)
+        if self.is_header_data(data) or self.is_plus_data(data):
+            return None
+        return neighbor
 
     # ── data helpers ─────────────────────────────────────────────────────────
     @classmethod
@@ -3286,10 +3344,26 @@ class CalNavTabBar(QTabBar):
         return super().minimumTabSizeHint(index)
 
     # ── mouse ─────────────────────────────────────────────────────────────────
+    def mouseMoveEvent(self, event):
+        super().mouseMoveEvent(event)
+        if not (event.buttons() & Qt.MouseButton.LeftButton):
+            return
+        neighbor = self._draggable_neighbor_at(event.pos())
+        if neighbor != self._dwell_neighbor:
+            self._reset_dwell()
+            self._dwell_neighbor = neighbor
+            if neighbor is not None:
+                self._dwell_timer.start(self._DWELL_MS)
+
     def mouseReleaseEvent(self, event):
         """After a drag-and-drop reorder, emit tabs_reordered so the caller can
         rebuild header positions safely — AFTER Qt has fully committed the drag."""
+        drop_target = self._group_hover_index
+        dragged_index = self.tabAt(event.pos())
+        self._reset_dwell()
         super().mouseReleaseEvent(event)
+        if drop_target is not None and dragged_index >= 0 and dragged_index != drop_target:
+            self.group_drop_requested.emit(dragged_index, drop_target)
         if self._drag_in_progress:
             self._drag_in_progress = False
             # Defer one more tick so Qt finishes any post-release internal cleanup
@@ -3320,7 +3394,27 @@ class CalNavTabBar(QTabBar):
         finally:
             painter.end()
 
+    def _paint_group_drop_pulse(self, painter: QPainter, idx: int):
+        """Breathing highlight ring shown while dwelling over a group-drop
+        target, so the release-to-group gesture has clear visual feedback."""
+        phase = (time.monotonic() % 1.0)
+        alpha = int(120 + 100 * abs(math.sin(phase * math.pi * 2)))
+        rect = self.tabRect(idx).adjusted(2, 2, -2, -2)
+        painter.save()
+        pen = painter.pen()
+        pen.setWidth(3)
+        c = QColor(AMBER)
+        c.setAlpha(alpha)
+        pen.setColor(c)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawRoundedRect(rect, 6, 6)
+        painter.restore()
+
     def _paint_group_overlays(self, painter: QPainter):
+        if self._group_hover_index is not None:
+            self._paint_group_drop_pulse(painter, self._group_hover_index)
+
         for idx in range(self.count()):
             raw = self.tabData(idx)
 
@@ -4004,6 +4098,27 @@ class CalNavWindow(QMainWindow):
         dlg = PasswordVaultDialog(self.password_manager, self)
         dlg.exec()
 
+    def _open_print_preview(self):
+        view = self.webview
+        if view is None:
+            return
+
+        def other_tabs():
+            out = []
+            for i in range(self._tab_widget.count()):
+                raw = self._tab_bar.tabData(i)
+                if CalNavTabBar.is_header_data(raw) or CalNavTabBar.is_plus_data(raw):
+                    continue
+                w = self._tab_widget.widget(i)
+                if not isinstance(w, QWebEngineView) or w is view:
+                    continue
+                label = self._tab_widget.tabText(i) or w.url().toString()
+                out.append((label, w))
+            return out
+
+        dlg = PrintPreviewDialog(view, other_tabs, parent=self)
+        dlg.exec()
+
     def _toggle_bookmark(self):
         url   = self.address_bar.text().strip()
         title = (self.webview.title() if self.webview else None) or url
@@ -4131,6 +4246,7 @@ class CalNavWindow(QMainWindow):
         QShortcut(QKeySequence("Ctrl+Shift+B"),   self, self._open_bookmarks)
         QShortcut(QKeySequence("Ctrl+Shift+P"),   self, self._open_profile_dialog)
         QShortcut(QKeySequence("Ctrl+Shift+K"),   self, self._open_password_vault)
+        QShortcut(QKeySequence("Ctrl+P"),         self, self._open_print_preview)
         QShortcut(QKeySequence("Ctrl+,"),         self, self._open_settings)
         # Tab management
         QShortcut(QKeySequence("Ctrl+T"),         self, lambda: self._new_tab(self._settings["homepage"]))
@@ -4718,6 +4834,30 @@ class CalNavWindow(QMainWindow):
                 self._groups.append(g)
                 self._assign_tab_group(tab_index, g.id)
 
+    def _handle_group_drop(self, dragged_index: int, target_index: int):
+        """User dragged a tab and paused it next to another one long enough
+        to signal "group these" (CalNavTabBar.group_drop_requested)."""
+        target_raw = self._tab_bar.tabData(target_index)
+        if CalNavTabBar.is_header_data(target_raw) or CalNavTabBar.is_plus_data(target_raw):
+            return
+        dragged_raw = self._tab_bar.tabData(dragged_index)
+        if CalNavTabBar.is_header_data(dragged_raw) or CalNavTabBar.is_plus_data(dragged_raw):
+            return
+        if target_raw:
+            # Target is already in a group — just join it.
+            self._assign_tab_group(dragged_index, target_raw)
+        elif dragged_raw and dragged_raw == target_raw:
+            return  # already grouped together (shouldn't happen, but be safe)
+        else:
+            dlg = GroupDialog(parent=self)
+            if dlg.exec() == QDialog.DialogCode.Accepted:
+                name, color = dlg.get_values()
+                if name:
+                    g = TabGroup.new(name, color)
+                    self._groups.append(g)
+                    self._assign_tab_group(target_index, g.id)
+                    self._assign_tab_group(dragged_index, g.id)
+
     def _edit_group(self, group_id: str):
         g = self._get_group(group_id)
         if not g:
@@ -5123,6 +5263,12 @@ class CalNavWindow(QMainWindow):
         self.btn_keys.clicked.connect(self._open_password_vault)
         h.addWidget(self.btn_keys)
 
+        # Print button
+        self.btn_print = NavButton("\U0001f5a8", "Stampa pagina  Ctrl+P")
+        self.btn_print.setFont(QFont("Segoe UI", 14))
+        self.btn_print.clicked.connect(self._open_print_preview)
+        h.addWidget(self.btn_print)
+
         # Theme toggle button
         _is_dark = _current_theme == "dark"
         self.btn_theme = NavButton("\u2600" if _is_dark else "\U0001f319",
@@ -5204,6 +5350,8 @@ class CalNavWindow(QMainWindow):
         # tabs_reordered fires in mouseReleaseEvent (not tabMoved), so Qt's
         # internal drag state is fully committed before we call removeTab/insertTab.
         self._tab_bar.tabs_reordered.connect(self._rebuild_headers)
+        # Drag a tab, pause briefly next to another one, release → group them.
+        self._tab_bar.group_drop_requested.connect(self._handle_group_drop)
 
         self._tab_widget = QTabWidget()
         self._tab_widget.setTabBar(self._tab_bar)

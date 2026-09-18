@@ -21,7 +21,7 @@ if hasattr(sys.stdout, "reconfigure"):
 # -- Configurazione ------------------------------------------------------------
 ROOT        = Path(__file__).parent.resolve()
 APP_NAME    = "CalNav"
-APP_VERSION = "1.1.26-alpha"
+APP_VERSION = "1.1.27-alpha"
 ICON_FILE   = ROOT / "logo_browser.ico"
 DIST_DIR    = ROOT / "dist"
 BUILD_DIR   = ROOT / "build"
@@ -172,6 +172,9 @@ def build_exe():
         "--hidden-import", "PyQt6.QtWebChannel",
         "--hidden-import", "PyQt6.QtNetwork",
         "--hidden-import", "PyQt6.QtPrintSupport",
+        "--hidden-import", "PyQt6.QtPdf",
+        "--hidden-import", "PyQt6.QtPdfWidgets",
+        "--hidden-import", "pikepdf",
         "--hidden-import", "cryptography",
         "--hidden-import", "cryptography.fernet",
         "--hidden-import", "cryptography.hazmat.primitives.kdf.pbkdf2",
@@ -198,8 +201,6 @@ def build_exe():
         "--exclude-module", "PyQt6.QtHelp",
         "--exclude-module", "PyQt6.QtTest",
         "--exclude-module", "PyQt6.QtStateMachine",
-        "--exclude-module", "PyQt6.QtPdf",
-        "--exclude-module", "PyQt6.QtPdfWidgets",
         "--exclude-module", "PyQt6.QtSvg",
         "--exclude-module", "PyQt6.QtSvgWidgets",
         "--exclude-module", "PyQt6.QtSql",
