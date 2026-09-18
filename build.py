@@ -21,7 +21,11 @@ if hasattr(sys.stdout, "reconfigure"):
 # -- Configurazione ------------------------------------------------------------
 ROOT        = Path(__file__).parent.resolve()
 APP_NAME    = "CalNav"
-APP_VERSION = "1.1.27-alpha"
+APP_VERSION = "1.1.28-alpha"
+# Keep in sync with RUNTIME_VERSION in calnav.py — bump ONLY when PyQt6/Qt or
+# the vendor/ payloads change. Lets the auto-updater ship a ~2 MB CalNav.exe
+# swap instead of a full reinstall when just our own code changed.
+RUNTIME_VERSION = 1
 ICON_FILE   = ROOT / "logo_browser.ico"
 DIST_DIR    = ROOT / "dist"
 BUILD_DIR   = ROOT / "build"
@@ -338,6 +342,29 @@ def make_portable():
     log("  -> Estrai e avvia CalNav.exe - nessuna installazione richiesta")
 
 
+# -- Step 4b - Asset per l'auto-update veloce ----------------------------------
+def make_fast_update_assets():
+    """Pubblica CalNav.exe da solo + un manifest con RUNTIME_VERSION, cosi'
+    l'updater puo' sostituire solo l'eseguibile (pochi secondi) invece di
+    reinstallare l'intero runtime Qt/Chromium quando questo non e' cambiato."""
+    step("Creazione asset per l'aggiornamento veloce")
+    RELEASE_DIR.mkdir(exist_ok=True)
+
+    src = _find_built_app()
+    exe_path = RELEASE_DIR / f"{APP_NAME}-{APP_VERSION}-exe-only.exe"
+    shutil.copy2(str(src / f"{APP_NAME}.exe"), str(exe_path))
+    mb = exe_path.stat().st_size / 1_048_576
+    log(f"[OK] Exe veloce: release/{exe_path.name}  ({mb:.1f} MB)")
+
+    import json
+    manifest_path = RELEASE_DIR / "runtime.json"
+    manifest_path.write_text(
+        json.dumps({"runtime_version": RUNTIME_VERSION, "app_version": APP_VERSION}),
+        encoding="utf-8",
+    )
+    log(f"[OK] Manifest: release/{manifest_path.name}  (runtime_version={RUNTIME_VERSION})")
+
+
 # -- Step 5 - Inno Setup -------------------------------------------------------
 def make_installer():
     step("Creazione installer Windows")
@@ -531,6 +558,7 @@ def main():
     create_icon()
     build_exe()
     make_portable()
+    make_fast_update_assets()
     make_installer()
 
     print()

@@ -1,7 +1,14 @@
 #!/usr/bin/env python3
 """CalNav Browser — Modern spirit, classic roots."""
 
-__version__ = "1.1.27-alpha"
+__version__ = "1.1.28-alpha"
+
+# Bumped ONLY when the frozen build's runtime dependencies change (PyQt6 /
+# PyQt6-WebEngine version, or the vendor/ payloads — WebView2Loader.dll,
+# WebPlugins). Used by the auto-updater to decide whether a new release can
+# use the fast path (swap the ~2 MB CalNav.exe in place) or needs the full
+# ~150 MB reinstall (runtime itself changed). Keep in sync with build.py.
+RUNTIME_VERSION = 1
 
 import json
 import math
@@ -2782,10 +2789,14 @@ class UpdateBar(QWidget):
         self._process: QProcess | None = None
         self._new_version = ""
         self._installer_url = ""
+        self._exe_url = ""
+        self._manifest_url = ""
         self._installer_path = ""
+        self._fast_path = False
         self._dl_nam = None
         self._dl_reply = None
         self._installer_file = None
+        self._manifest_nam = None
         self._build()
         self.hide()
 
@@ -2830,9 +2841,12 @@ class UpdateBar(QWidget):
     def retheme(self):
         self._msg.setStyleSheet(f"color: {TEXT_BRIGHT}; font-size: 12px;")
 
-    def show_update(self, version: str, installer_url: str = ""):
+    def show_update(self, version: str, installer_url: str = "",
+                     exe_url: str = "", manifest_url: str = ""):
         self._new_version = version
         self._installer_url = installer_url
+        self._exe_url = exe_url
+        self._manifest_url = manifest_url
         self._set_idle(f"Disponibile CalNav {version}  —  stai usando la {__version__}")
         self.show()
 
@@ -2887,18 +2901,71 @@ class UpdateBar(QWidget):
             _GITHUB_PKG,
         ])
 
-    # ── Frozen-build update: download Setup.exe and run it ─────────────────────
+    # ── Frozen-build update ──────────────────────────────────────────────────
     def _update_frozen(self):
+        """Decide fast path (swap the ~2 MB CalNav.exe) vs. full reinstall.
+
+        The fast path only applies when the release ships both the exe-only
+        asset and a runtime manifest declaring the SAME RUNTIME_VERSION we're
+        currently running — i.e. PyQt6/Qt/vendor DLLs are unchanged, only our
+        own Python code differs. Anything else (older release without these
+        assets, or a runtime bump) falls back to the full Setup.exe reinstall.
+        """
         if not self._installer_url:
             self._set_error("❌  Installer non trovato nella release — aggiorna manualmente.")
             return
+        if self._exe_url and self._manifest_url:
+            self._set_busy("⏳  Verifica aggiornamento veloce…")
+            self._fetch_manifest(self._manifest_url, self._on_manifest_fetched)
+        else:
+            self._download_full_installer()
+
+    def _fetch_manifest(self, url: str, on_done):
+        nam = QNetworkAccessManager(self)
+        self._manifest_nam = nam   # keep alive until the reply fires
+        req = QNetworkRequest(QUrl(url))
+        req.setRawHeader(b"User-Agent", b"CalNav-Browser-Updater")
+        req.setTransferTimeout(8000)
+        reply = nam.get(req)
+        reply.finished.connect(lambda: on_done(reply))
+
+    def _on_manifest_fetched(self, reply):
+        from PyQt6.QtNetwork import QNetworkReply
+        ok = reply.error() == QNetworkReply.NetworkError.NoError
+        remote_runtime = None
+        if ok:
+            try:
+                remote_runtime = json.loads(bytes(reply.readAll()).decode()).get("runtime_version")
+            except Exception:
+                remote_runtime = None
+        reply.deleteLater()
+        if remote_runtime == RUNTIME_VERSION:
+            self._download_exe_fast_path()
+        else:
+            # Runtime changed (or manifest unreadable) — full reinstall.
+            self._download_full_installer()
+
+    # ── Fast path: download just CalNav.exe and swap it in place ────────────
+
+    def _download_exe_fast_path(self):
+        self._set_busy("⏳  Download aggiornamento veloce…  0%")
+        import tempfile, os as _os
+        self._installer_path = _os.path.join(
+            tempfile.gettempdir(), f"CalNav-{self._new_version}-new.exe")
+        self._fast_path = True
+        self._start_download(self._exe_url)
+
+    def _download_full_installer(self):
         self._set_busy("⏳  Download aggiornamento…  0%")
         import tempfile, os as _os
         self._installer_path = _os.path.join(
             tempfile.gettempdir(), f"CalNav-{self._new_version}-Setup.exe")
+        self._fast_path = False
+        self._start_download(self._installer_url)
 
+    def _start_download(self, url: str):
         self._dl_nam = QNetworkAccessManager(self)
-        req = QNetworkRequest(QUrl(self._installer_url))
+        req = QNetworkRequest(QUrl(url))
         req.setRawHeader(b"User-Agent", b"CalNav-Browser-Updater")
         # GitHub asset URLs 302-redirect to the CDN; follow them.
         req.setAttribute(
@@ -2923,7 +2990,8 @@ class UpdateBar(QWidget):
 
     def _on_dl_progress(self, received: int, total: int):
         if total > 0:
-            self._set_busy(f"⏳  Download aggiornamento…  {received * 100 // total}%")
+            label = "Download aggiornamento veloce" if self._fast_path else "Download aggiornamento"
+            self._set_busy(f"⏳  {label}…  {received * 100 // total}%")
 
     def _on_dl_ready_read(self):
         # Stream to disk incrementally instead of buffering the whole
@@ -2944,7 +3012,10 @@ class UpdateBar(QWidget):
             return
         reply.deleteLater()
         self._set_done(f"✅  Installazione {self._new_version} — riavvio…")
-        QTimer.singleShot(800, self._run_installer)
+        if self._fast_path:
+            QTimer.singleShot(400, self._run_exe_swap)
+        else:
+            QTimer.singleShot(800, self._run_installer)
 
     def _run_installer(self):
         """Launch the Inno Setup installer silently, then quit so it can replace
@@ -2965,6 +3036,51 @@ class UpdateBar(QWidget):
         if ret <= 32:
             # ShellExecute failed or the user dismissed the UAC prompt — keep
             # the current app running instead of closing into nothing.
+            self._set_error("❌  Aggiornamento annullato (elevazione negata).")
+            return
+        _os._exit(0)
+
+    def _run_exe_swap(self):
+        """Fast path: hand off to a tiny elevated PowerShell script that waits
+        for this process to exit, replaces CalNav.exe with the freshly
+        downloaded one, and relaunches it — no Inno Setup, no ~150 MB reinstall.
+
+        Runs elevated (the install directory is under Program Files) via the
+        same ShellExecute 'runas' pattern as the full installer.
+        """
+        import ctypes, os as _os, tempfile
+
+        target_exe = sys.executable   # the currently running CalNav.exe
+        pid = _os.getpid()
+        script_path = _os.path.join(tempfile.gettempdir(), "calnav_fast_update.ps1")
+        script = f"""
+$ErrorActionPreference = 'SilentlyContinue'
+try {{ Wait-Process -Id {pid} -Timeout 15 }} catch {{}}
+Start-Sleep -Milliseconds 400
+for ($i = 0; $i -lt 25; $i++) {{
+    Remove-Item -LiteralPath '{target_exe}' -Force
+    Move-Item -LiteralPath '{self._installer_path}' -Destination '{target_exe}' -Force
+    if (Test-Path -LiteralPath '{target_exe}') {{ break }}
+    Start-Sleep -Milliseconds 400
+}}
+Start-Process -FilePath '{target_exe}'
+"""
+        try:
+            with open(script_path, "w", encoding="utf-8") as f:
+                f.write(script)
+        except OSError as e:
+            self._set_error(f"❌  Preparazione aggiornamento fallita: {str(e)[:80]}")
+            return
+
+        args = (f'-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden '
+                f'-File "{script_path}"')
+        try:
+            ret = ctypes.windll.shell32.ShellExecuteW(
+                None, "runas", "powershell.exe", args, None, 0)
+        except Exception as e:
+            self._set_error(f"❌  Avvio aggiornamento fallito: {str(e)[:80]}")
+            return
+        if ret <= 32:
             self._set_error("❌  Aggiornamento annullato (elevazione negata).")
             return
         _os._exit(0)
@@ -3005,7 +3121,8 @@ class UpdateBar(QWidget):
 
 # ── Update checker ────────────────────────────────────────────────────────────
 class UpdateChecker(QObject):
-    update_available = pyqtSignal(str, str)   # (nuova versione, url installer .exe)
+    # (nuova versione, url Setup.exe, url CalNav.exe "fast path", url runtime.json)
+    update_available = pyqtSignal(str, str, str, str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -3029,13 +3146,20 @@ class UpdateChecker(QObject):
                 data = data[0] if data else {}
             tag = data.get("tag_name", "").lstrip("vV").strip()
             if tag and self._is_newer(tag, __version__):
-                # Grab the Setup.exe asset URL so the frozen build can self-update.
-                installer_url = ""
+                # Grab the Setup.exe asset URL so the frozen build can self-update,
+                # plus the fast-path exe-only asset and its runtime manifest —
+                # both optional (older releases won't have them).
+                installer_url = exe_url = manifest_url = ""
                 for asset in data.get("assets", []):
-                    if asset.get("name", "").lower().endswith("setup.exe"):
-                        installer_url = asset.get("browser_download_url", "")
-                        break
-                self.update_available.emit(tag, installer_url)
+                    name = asset.get("name", "").lower()
+                    url = asset.get("browser_download_url", "")
+                    if name.endswith("setup.exe"):
+                        installer_url = url
+                    elif name.endswith("-exe-only.exe"):
+                        exe_url = url
+                    elif name == "runtime.json":
+                        manifest_url = url
+                self.update_available.emit(tag, installer_url, exe_url, manifest_url)
         except Exception:
             pass
         finally:
@@ -4098,8 +4222,8 @@ class CalNavWindow(QMainWindow):
         dlg = PasswordVaultDialog(self.password_manager, self)
         dlg.exec()
 
-    def _open_print_preview(self):
-        view = self.webview
+    def _open_print_preview(self, view: Optional[QWebEngineView] = None):
+        view = view or self.webview
         if view is None:
             return
 
@@ -4118,6 +4242,39 @@ class CalNavWindow(QMainWindow):
 
         dlg = PrintPreviewDialog(view, other_tabs, parent=self)
         dlg.exec()
+
+    def _show_more_menu(self):
+        """Dropdown for the less-frequently-used settings — stampa, tema,
+        impostazioni (always last) — instead of a separate icon each."""
+        menu = QMenu(self)
+        menu.setStyleSheet(f"""
+            QMenu {{
+                background: {NAVY_MID}; color: {TEXT_BRIGHT};
+                border: 1px solid #253852; border-radius: 8px; padding: 4px;
+            }}
+            QMenu::item {{ padding: 6px 20px 6px 12px; border-radius: 5px; }}
+            QMenu::item:selected {{ background: rgba(0,212,255,0.15); color: {TEAL}; }}
+            QMenu::separator {{ height: 1px; background: #253852; margin: 4px 8px; }}
+        """)
+
+        act_print = menu.addAction("\U0001f5a8  Stampa pagina  Ctrl+P")
+        act_print.triggered.connect(self._open_print_preview)
+
+        menu.addSeparator()
+
+        _is_dark = _current_theme == "dark"
+        theme_label = ("☀  Passa a tema chiaro" if _is_dark
+                       else "\U0001f319  Passa a tema scuro")
+        act_theme = menu.addAction(theme_label)
+        act_theme.triggered.connect(self._toggle_theme)
+
+        menu.addSeparator()
+
+        act_settings = menu.addAction("⚙  Impostazioni  Ctrl+,")
+        act_settings.triggered.connect(self._open_settings)
+
+        menu.exec(self.btn_more.mapToGlobal(
+            self.btn_more.rect().bottomLeft()))
 
     def _toggle_bookmark(self):
         url   = self.address_bar.text().strip()
@@ -4799,6 +4956,13 @@ class CalNavWindow(QMainWindow):
                 act_new = menu.addAction("＋  Nuova scheda")
                 act_new.triggered.connect(lambda: self._new_tab(self._settings["homepage"]))
 
+                tab_view = self._tab_widget.widget(index)
+                if isinstance(tab_view, QWebEngineView):
+                    menu.addSeparator()
+                    act_print = menu.addAction("🖨  Stampa scheda…")
+                    act_print.triggered.connect(
+                        lambda _, v=tab_view: self._open_print_preview(v))
+
                 menu.addSeparator()
                 act_close = menu.addAction("✕  Chiudi scheda  Ctrl+W")
                 act_close.triggered.connect(lambda: self._close_tab(index))
@@ -5263,25 +5427,12 @@ class CalNavWindow(QMainWindow):
         self.btn_keys.clicked.connect(self._open_password_vault)
         h.addWidget(self.btn_keys)
 
-        # Print button
-        self.btn_print = NavButton("\U0001f5a8", "Stampa pagina  Ctrl+P")
-        self.btn_print.setFont(QFont("Segoe UI", 14))
-        self.btn_print.clicked.connect(self._open_print_preview)
-        h.addWidget(self.btn_print)
-
-        # Theme toggle button
-        _is_dark = _current_theme == "dark"
-        self.btn_theme = NavButton("\u2600" if _is_dark else "\U0001f319",
-                                   "Passa a tema chiaro" if _is_dark else "Passa a tema scuro")
-        self.btn_theme.setFont(QFont("Segoe UI", 13))
-        self.btn_theme.clicked.connect(self._toggle_theme)
-        h.addWidget(self.btn_theme)
-
-        # Gear button (settings)
-        self.btn_settings = NavButton("\u2699", "Impostazioni  Ctrl+,")
-        self.btn_settings.setFont(QFont("Segoe UI", 16))
-        self.btn_settings.clicked.connect(self._open_settings)
-        h.addWidget(self.btn_settings)
+        # "More" button \u2014 dropdown with the less-frequently-used settings
+        # (stampa, tema, impostazioni) instead of one icon each on the toolbar.
+        self.btn_more = NavButton("\u22ee", "Altro")
+        self.btn_more.setFont(QFont("Segoe UI", 16))
+        self.btn_more.clicked.connect(self._show_more_menu)
+        h.addWidget(self.btn_more)
 
         # Profile avatar button
         self.btn_profile = ProfileAvatarButton()

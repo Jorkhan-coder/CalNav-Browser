@@ -53,3 +53,11 @@ jobs:
         with:
           files: release/*-Setup.exe
         continue-on-error: true   # skip silently if Inno Setup build failed
+
+      # ── 7. Upload fast-update assets (exe-only + runtime manifest) ──────────
+      - name: Upload fast-update assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release/*-exe-only.exe
+            release/runtime.json
