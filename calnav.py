@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """CalNav Browser — Modern spirit, classic roots."""
 
-__version__ = "1.1.33-alpha"
+__version__ = "1.1.34-alpha"
 
 # Bumped ONLY when the frozen build's runtime dependencies change (PyQt6 /
 # PyQt6-WebEngine version, or the vendor/ payloads — WebView2Loader.dll,
@@ -4407,7 +4407,8 @@ class BrowserView(QWebEngineView):
         act_print.triggered.connect(self.printRequested.emit)
         menu.addAction(page.action(WA.SavePage))
         menu.addSeparator()
-        menu.addAction(page.action(WA.ViewSource))
+        act_source = menu.addAction("👁  Visualizza sorgente  Ctrl+U")
+        act_source.triggered.connect(self.open_source_viewer)
         menu.addAction(page.action(WA.InspectElement))
         return menu
 
@@ -4415,6 +4416,11 @@ class BrowserView(QWebEngineView):
         menu = self._build_context_menu()
         if menu is not None:
             menu.exec(event.globalPos())
+
+    def open_source_viewer(self):
+        from calnav_source_viewer import SourceViewerDialog
+        dlg = SourceViewerDialog(self, parent=self.window())
+        dlg.exec()
 
 
 # ── Main window ───────────────────────────────────────────────────────────────
@@ -4838,6 +4844,7 @@ class CalNavWindow(QMainWindow):
         QShortcut(QKeySequence("Ctrl+H"),         self, lambda: self.load(self._settings["homepage"]))
         QShortcut(QKeySequence("Ctrl+I"),         self, self._toggle_ie_mode)
         QShortcut(QKeySequence("F12"),            self, self._open_devtools)
+        QShortcut(QKeySequence("Ctrl+U"),         self, lambda: self.webview.open_source_viewer() if self.webview else None)
         QShortcut(QKeySequence("Ctrl+D"),         self, self._toggle_bookmark)
         QShortcut(QKeySequence("Ctrl+Shift+B"),   self, self._open_bookmarks)
         QShortcut(QKeySequence("Ctrl+Shift+P"),   self, self._open_profile_dialog)
