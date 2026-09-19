@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """CalNav Browser — Modern spirit, classic roots."""
 
-__version__ = "1.1.37-alpha"
+__version__ = "1.1.38-alpha"
 
 # Bumped ONLY when the frozen build's runtime dependencies change (PyQt6 /
 # PyQt6-WebEngine version, or the vendor/ payloads — WebView2Loader.dll,
@@ -6478,7 +6478,17 @@ def main():
         # On Windows N (no Media Feature Pack) or when GPU H.264 decode is
         # blocked, Chromium silently fails the hardware path and reports
         # "codec not supported".  This flag bypasses that path entirely.
-        "--disable-accelerated-video-decode"
+        "--disable-accelerated-video-decode "
+        # GPU *compositing* (confirmed working via a WebGL renderer probe —
+        # real GPU, not SwiftShader) is a separate Chromium feature from GPU
+        # *rasterization* (turning paint records into tile bitmaps). Many
+        # QtWebEngine builds ship with rasterization off by default, so every
+        # tile is drawn on the CPU — fine for simple pages, but on
+        # graphics-heavy ones the CPU can't keep up during scroll/repaint and
+        # Chromium shows its "checkerboard" placeholder for tiles that aren't
+        # ready yet. These flags turn GPU rasterization on explicitly.
+        "--enable-gpu-rasterization --enable-zero-copy --ignore-gpu-blocklist "
+        "--enable-oop-rasterization"
     )
     if "--autoplay-policy=no-user-gesture-required" not in _existing:
         os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = (

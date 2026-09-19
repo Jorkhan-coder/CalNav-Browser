@@ -21,7 +21,7 @@ if hasattr(sys.stdout, "reconfigure"):
 # -- Configurazione ------------------------------------------------------------
 ROOT        = Path(__file__).parent.resolve()
 APP_NAME    = "CalNav"
-APP_VERSION = "1.1.37-alpha"
+APP_VERSION = "1.1.38-alpha"
 # Keep in sync with RUNTIME_VERSION in calnav.py — bump ONLY when PyQt6/Qt or
 # the vendor/ payloads change. Lets the auto-updater ship a ~2 MB CalNav.exe
 # swap instead of a full reinstall when just our own code changed.
