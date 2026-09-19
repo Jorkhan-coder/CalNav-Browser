@@ -361,7 +361,8 @@ class SourceViewerDialog(QDialog):
         self.setWindowTitle(f"👁  Sorgente — {view.title() or view.url().toString()}")
         self.resize(1040, 740)
         self._build()
-        self._load_dom()
+        self._load_dom()      # needed for the extraction/analysis panels either way
+        self._fetch_raw()     # default view is "HTML originale"
 
     # ── UI ───────────────────────────────────────────────────────────────
 
@@ -375,8 +376,8 @@ class SourceViewerDialog(QDialog):
         top.addWidget(QLabel("Vista:"))
         self._mode_combo = QComboBox()
         self._mode_combo.addItems([
-            "🧬 DOM live (dopo JavaScript)",
             "📄 HTML originale (dal server)",
+            "🧬 DOM live (dopo JavaScript)",
         ])
         self._mode_combo.currentIndexChanged.connect(self._on_mode_changed)
         top.addWidget(self._mode_combo)
@@ -450,9 +451,9 @@ class SourceViewerDialog(QDialog):
 
     def _on_dom_html(self, html: str):
         self._dom_html = html or ""
-        self._status.setText("🧬  DOM live pronto — dal menu \"Vista\" puoi confrontarlo con l'HTML originale.")
-        if self._mode_combo.currentIndex() == 0:
+        if self._mode_combo.currentIndex() == 1:
             self._show_html(self._dom_html)
+            self._status.setText("🧬  DOM live (dopo l'esecuzione di JavaScript).")
         self._populate_extracted(self._dom_html)
 
     def _fetch_raw(self):
@@ -476,14 +477,14 @@ class SourceViewerDialog(QDialog):
             self._raw_html = text
             self._raw_fetched = True
             self._status.setText("📄  HTML originale (come inviato dal server, prima di ogni JavaScript).")
-            if self._mode_combo.currentIndex() == 1:
+            if self._mode_combo.currentIndex() == 0:
                 self._show_html(text)
         else:
             self._status.setText(f"❌  Download HTML originale fallito: {reply.errorString()}")
         reply.deleteLater()
 
     def _on_mode_changed(self, index: int):
-        if index == 0:
+        if index == 1:
             self._show_html(self._dom_html)
             self._status.setText("🧬  DOM live (dopo l'esecuzione di JavaScript).")
         else:

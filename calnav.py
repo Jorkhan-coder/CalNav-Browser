@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """CalNav Browser — Modern spirit, classic roots."""
 
-__version__ = "1.1.35-alpha"
+__version__ = "1.1.36-alpha"
 
 # Bumped ONLY when the frozen build's runtime dependencies change (PyQt6 /
 # PyQt6-WebEngine version, or the vendor/ payloads — WebView2Loader.dll,
@@ -4425,11 +4425,18 @@ class BrowserView(QWebEngineView):
         menu.addSeparator()
         act_print = menu.addAction("🖨  Stampa pagina  Ctrl+P")
         act_print.triggered.connect(self.printRequested.emit)
-        menu.addAction(page.action(WA.SavePage))
+        # QtWebEngine's own WebActions carry hardcoded English text (Chromium
+        # strings, not Qt's own translated ones) — set our Italian labels on
+        # them explicitly rather than mixing languages in the same menu.
+        act_save = page.action(WA.SavePage)
+        act_save.setText("💾  Salva pagina")
+        menu.addAction(act_save)
         menu.addSeparator()
         act_source = menu.addAction("👁  Visualizza sorgente  Ctrl+U")
         act_source.triggered.connect(self.open_source_viewer)
-        menu.addAction(page.action(WA.InspectElement))
+        act_inspect = page.action(WA.InspectElement)
+        act_inspect.setText("🔧  Ispeziona elemento")
+        menu.addAction(act_inspect)
         return menu
 
     def contextMenuEvent(self, event):
