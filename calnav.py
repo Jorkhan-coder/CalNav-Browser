@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """CalNav Browser — Modern spirit, classic roots."""
 
-__version__ = "1.1.39-alpha"
+__version__ = "1.1.40-alpha"
 
 # Bumped ONLY when the frozen build's runtime dependencies change (PyQt6 /
 # PyQt6-WebEngine version, or the vendor/ payloads — WebView2Loader.dll,
@@ -54,6 +54,7 @@ from PyQt6.QtWidgets import (
     QSplitter, QListWidget, QListWidgetItem, QCheckBox, QComboBox,
     QSpinBox, QFormLayout, QFileDialog, QStackedWidget,
 )
+from PyQt6.QtQuick import QQuickWindow, QSGRendererInterface
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWebEngineCore import (
     QWebEngineProfile, QWebEngineSettings, QWebEngineScript, QWebEnginePage,
@@ -306,11 +307,35 @@ CHROME_COMPAT_JS = """
 
 DETECT_FORMS_JS = """
 (function() {
-    if (typeof QWebChannel === 'undefined' || typeof qt === 'undefined') return;
+    // Two distinct races made this never fire, confirmed by direct tracing:
+    // (1) qt.webChannelTransport can be assigned before it's actually able
+    //     to complete a handshake — so even when it already looks truthy on
+    //     the very first check, a QWebChannel created from it can silently
+    //     never call its callback (no error, no retry, just nothing).
+    // (2) That failure is invisible from here: QWebChannel gives no
+    //     "handshake failed" event, only the callback that never comes.
+    // So this doesn't just wait for the transport to *exist* — it also
+    // gives each channel attempt a deadline, and tries again (a fresh
+    // QWebChannel instance) if that attempt never calls back.
+    var attempts = 0;
+    var channelReady = false;
+    function tryInit() {
+        if (typeof QWebChannel === 'undefined' || typeof qt === 'undefined'
+            || !qt.webChannelTransport) {
+            if (++attempts < 40) { setTimeout(tryInit, 50); }
+            return;
+        }
+        new QWebChannel(qt.webChannelTransport, onChannel);
+        setTimeout(function() {
+            if (!channelReady && ++attempts < 40) { tryInit(); }
+        }, 250);
+    }
 
-    new QWebChannel(qt.webChannelTransport, function(channel) {
+    function onChannel(channel) {
+        if (channelReady) return;  // a retried, earlier channel finally answered late
         var bridge = channel.objects.calnav_bridge;
         if (!bridge) return;
+        channelReady = true;
 
         // Last non-empty username/password pair seen anywhere on the page —
         // kept up to date on every keystroke (see the 'input' listener
@@ -388,7 +413,9 @@ DETECT_FORMS_JS = """
 
         new MutationObserver(function() { scanForms(); })
             .observe(document.documentElement, { childList: true, subtree: true });
-    });
+    }
+
+    tryInit();
 })();
 """
 
@@ -6459,6 +6486,22 @@ def main():
     # (visible on graphics-heavy pages) and stutter that looks like the page
     # keeps half-refreshing — worse the more tabs/views are open at once.
     QApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts, True)
+
+    # chrome://gpu (checked live inside CalNav) reports "Direct composition:
+    # false" for every tab, even with the real NVIDIA GPU active — Chrome and
+    # Edge on the same machine always show it enabled. QWebEngineView is
+    # internally backed by a QQuickWidget/RHI surface, but with no graphics
+    # API selected for Qt Quick before the QApplication is built, the
+    # top-level window gets a plain raster backing store and QtWebEngine's
+    # GPU-rendered frames have to be read back to the CPU before Qt can
+    # paint them — a slow, fragile hand-off that shows up as checkerboard
+    # tiles/tearing/incomplete frames on graphics-heavy pages, worse under
+    # resize or DPI/monitor changes. ANGLE is already using Direct3D11 (see
+    # chrome://gpu's GL_RENDERER), so selecting the same backend for Qt
+    # Quick's RHI lets the whole chain — Chromium's GPU process, ANGLE, and
+    # Qt's own compositing — share one Direct3D11 device instead of forcing
+    # a CPU round-trip, which should let DirectComposition actually engage.
+    QQuickWindow.setGraphicsApi(QSGRendererInterface.GraphicsApi.Direct3D11)
 
     # Confirmed report: checkerboarding/tearing happens ONLY in CalNav, never
     # in Chrome/Edge on the same PC, on a 4K monitor running Windows' 150%
