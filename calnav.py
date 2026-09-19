@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """CalNav Browser — Modern spirit, classic roots."""
 
-__version__ = "1.1.32-alpha"
+__version__ = "1.1.33-alpha"
 
 # Bumped ONLY when the frozen build's runtime dependencies change (PyQt6 /
 # PyQt6-WebEngine version, or the vendor/ payloads — WebView2Loader.dll,
@@ -22,6 +22,7 @@ import math
 import os
 import re
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -78,6 +79,25 @@ _SETTINGS_DEFAULTS = {"homepage": HOME_URL, "theme": "dark", "download_dir": ""}
 def _default_download_dir() -> str:
     path = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DownloadLocation)
     return path or str(Path.home() / "Downloads")
+
+
+def _shared_update_dir() -> str:
+    """Machine-wide (not per-user) folder for the fast-update helper's
+    script/log.
+
+    On an account that isn't itself an administrator, the UAC "runas"
+    elevation prompt can run the elevated process as a DIFFERENT Windows
+    user than the one who clicked "Aggiorna" — anything written under that
+    account's own per-user %TEMP% would then sit somewhere the original
+    user has no easy way to see. %ProgramData% belongs to no single user
+    profile and is writable/readable by any account by default, which
+    sidesteps that mismatch entirely."""
+    base = os.path.join(os.environ.get("ProgramData", r"C:\ProgramData"), "CalNav")
+    try:
+        os.makedirs(base, exist_ok=True)
+    except OSError:
+        return tempfile.gettempdir()
+    return base
 
 
 def _load_settings() -> dict:
@@ -3222,8 +3242,9 @@ class UpdateBar(QWidget):
         self.about_to_relaunch.emit()
         target_exe = sys.executable   # the currently running CalNav.exe
         pid = _os.getpid()
-        script_path = _os.path.join(tempfile.gettempdir(), "calnav_fast_update.ps1")
-        log_path = _os.path.join(tempfile.gettempdir(), "calnav_fast_update.log")
+        update_dir = _shared_update_dir()
+        script_path = _os.path.join(update_dir, "calnav_fast_update.ps1")
+        log_path = _os.path.join(update_dir, "calnav_fast_update.log")
         # NOTE: the previous version of this script checked success with
         # `Test-Path target_exe` after the swap attempt — which is ALWAYS
         # true (the old file is still sitting right there if Remove-Item
@@ -3235,6 +3256,7 @@ class UpdateBar(QWidget):
         # Stop + try/catch), and actually retry on failure.
         script = f"""
 $ErrorActionPreference = 'Stop'
+New-Item -ItemType Directory -Force -Path '{update_dir}' | Out-Null
 "" | Out-File -FilePath '{log_path}' -Encoding utf8
 try {{ Wait-Process -Id {pid} -Timeout 15 }} catch {{}}
 Start-Sleep -Milliseconds 500
@@ -4437,6 +4459,7 @@ class CalNavWindow(QMainWindow):
         self._setup_shortcuts()
         self._update_profile_button()
         self._restore_session()   # opens tabs from saved session (or homepage)
+        self._report_fast_update_outcome()
 
         # Check for updates 30 s after startup (gives the app time to settle
         # and avoids showing a notification immediately after an auto-update restart)
@@ -4567,6 +4590,35 @@ class CalNavWindow(QMainWindow):
         prof = self.profile_manager.current
         self.btn_profile.update_profile(prof.initial, prof.color)
         self.setWindowTitle(f"CalNav — {prof.display_name}")
+
+    def _report_fast_update_outcome(self):
+        """If a fast-update swap ran before this launch, surface what
+        actually happened instead of leaving it to a silent log file only
+        the developer would think to look for."""
+        log_path = os.path.join(_shared_update_dir(), "calnav_fast_update.log")
+        if not os.path.exists(log_path):
+            return
+        try:
+            age = time.time() - os.path.getmtime(log_path)
+            content = Path(log_path).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return
+        finally:
+            try:
+                os.remove(log_path)   # one-shot — don't show it again next launch
+            except OSError:
+                pass
+        if age > 600:
+            return   # stale leftover from way earlier, not from this relaunch
+        if "swap succeeded" in content:
+            self.statusBar().showMessage(
+                f"✅  Aggiornamento veloce completato — ora su CalNav {__version__}.", 6000)
+        elif "swap FAILED" in content:
+            self.statusBar().showMessage(
+                "⚠  L'ultimo aggiornamento veloce non è riuscito a sostituire il file — "
+                "riprova, oppure scarica manualmente il Setup.exe dalla pagina delle release.",
+                10_000,
+            )
 
     def _switch_profile(self, name: str):
         # Save session for old profile before switching
