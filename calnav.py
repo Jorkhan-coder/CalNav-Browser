@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """CalNav Browser — Modern spirit, classic roots."""
 
-__version__ = "1.1.36-alpha"
+__version__ = "1.1.37-alpha"
 
 # Bumped ONLY when the frozen build's runtime dependencies change (PyQt6 /
 # PyQt6-WebEngine version, or the vendor/ payloads — WebView2Loader.dll,
@@ -3363,6 +3363,11 @@ Start-Process -FilePath '{target_exe}'
 class UpdateChecker(QObject):
     # (nuova versione, url Setup.exe, url CalNav.exe "fast path", url runtime.json)
     update_available = pyqtSignal(str, str, str, str)
+    # Emitted only by callers that care about the "already up to date" case
+    # (the manual "Verifica aggiornamento" button) — the silent 30s startup
+    # check never connects to these, so it stays exactly as quiet as before.
+    no_update = pyqtSignal()
+    check_failed = pyqtSignal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -3379,6 +3384,7 @@ class UpdateChecker(QObject):
         try:
             from PyQt6.QtNetwork import QNetworkReply
             if reply.error() != QNetworkReply.NetworkError.NoError:
+                self.check_failed.emit(reply.errorString())
                 return
             data = json.loads(bytes(reply.readAll()).decode())
             # /releases?per_page=1 returns a list; /releases/latest returns a dict
@@ -3400,8 +3406,12 @@ class UpdateChecker(QObject):
                     elif name == "runtime.json":
                         manifest_url = url
                 self.update_available.emit(tag, installer_url, exe_url, manifest_url)
-        except Exception:
-            pass
+            elif tag:
+                self.no_update.emit()
+            else:
+                self.check_failed.emit("Risposta inattesa dal server.")
+        except Exception as exc:
+            self.check_failed.emit(str(exc))
         finally:
             reply.deleteLater()
 
@@ -3662,11 +3672,89 @@ class SettingsDialog(QDialog):
                 lbl_v = QLabel(value)
                 lbl_v.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
             lbl_v.setStyleSheet("font-size: 12px;")
-            row.addWidget(lbl_v, stretch=1)
+            row.addWidget(lbl_v)
+
+            if label == "Versione CalNav":
+                row.addSpacing(12)
+                self._btn_check_update = QPushButton("Verifica aggiornamento")
+                self._btn_check_update.setCursor(Qt.CursorShape.PointingHandCursor)
+                self._btn_check_update.setFixedHeight(26)
+                self._btn_check_update.setStyleSheet(f"""
+                    QPushButton {{ background: transparent; color: {TEAL}; border: 1px solid {TEAL_DIM};
+                        border-radius: 6px; padding: 0 12px; font-size: 11px; }}
+                    QPushButton:hover {{ background: rgba(0,212,255,0.12); }}
+                    QPushButton:disabled {{ color: {TEXT_DIM}; border-color: #253852; }}
+                """)
+                self._btn_check_update.clicked.connect(self._on_check_update)
+                row.addWidget(self._btn_check_update)
+
+                self._btn_launch_update = QPushButton("⬇  Aggiorna ora")
+                self._btn_launch_update.setCursor(Qt.CursorShape.PointingHandCursor)
+                self._btn_launch_update.setFixedHeight(26)
+                self._btn_launch_update.setStyleSheet("""
+                    QPushButton { background: #51CF66; color: #07111F; border: none;
+                        border-radius: 6px; padding: 0 12px; font-size: 11px; font-weight: bold; }
+                    QPushButton:hover { background: #69DB7C; }
+                """)
+                self._btn_launch_update.clicked.connect(self._on_launch_update)
+                self._btn_launch_update.setVisible(False)
+                row.addWidget(self._btn_launch_update)
+
+            row.addStretch(1)
             vbox.addLayout(row)
+
+        self._lbl_update_status = QLabel("")
+        self._lbl_update_status.setStyleSheet(f"font-size: 11px; color: {TEXT_DIM}; padding-left: 122px;")
+        vbox.addWidget(self._lbl_update_status)
+
+        self._manual_checker: Optional["UpdateChecker"] = None
+        self._pending_update = None
 
         vbox.addStretch()
         return page
+
+    def _on_check_update(self):
+        self._btn_check_update.setEnabled(False)
+        self._btn_check_update.setText("Verifica in corso…")
+        self._btn_launch_update.setVisible(False)
+        self._pending_update = None
+        self._lbl_update_status.setStyleSheet(f"font-size: 11px; color: {TEXT_DIM}; padding-left: 122px;")
+        self._lbl_update_status.setText("")
+
+        self._manual_checker = UpdateChecker(self)
+        self._manual_checker.update_available.connect(self._on_manual_update_found)
+        self._manual_checker.no_update.connect(self._on_manual_no_update)
+        self._manual_checker.check_failed.connect(self._on_manual_check_failed)
+        self._manual_checker.check()
+
+    def _on_manual_update_found(self, tag, installer_url, exe_url, manifest_url):
+        self._btn_check_update.setEnabled(True)
+        self._btn_check_update.setText("Verifica aggiornamento")
+        self._pending_update = (tag, installer_url, exe_url, manifest_url)
+        self._btn_launch_update.setVisible(True)
+        self._lbl_update_status.setStyleSheet("font-size: 11px; color: #51CF66; padding-left: 122px;")
+        self._lbl_update_status.setText(f"🟢  Nuova versione disponibile: {tag}")
+
+    def _on_manual_no_update(self):
+        self._btn_check_update.setEnabled(True)
+        self._btn_check_update.setText("Verifica aggiornamento")
+        self._lbl_update_status.setStyleSheet(f"font-size: 11px; color: {TEXT_DIM}; padding-left: 122px;")
+        self._lbl_update_status.setText("✔  Hai già la versione più recente.")
+
+    def _on_manual_check_failed(self, message: str):
+        self._btn_check_update.setEnabled(True)
+        self._btn_check_update.setText("Verifica aggiornamento")
+        self._lbl_update_status.setStyleSheet("font-size: 11px; color: #FFB84D; padding-left: 122px;")
+        self._lbl_update_status.setText("⚠  Verifica non riuscita — controlla la connessione e riprova.")
+
+    def _on_launch_update(self):
+        if not self._pending_update:
+            return
+        win = self.parent()
+        if hasattr(win, "_update_bar"):
+            win._update_bar.show_update(*self._pending_update)
+            win._update_bar._on_update()
+        self.reject()
 
     # ── Save ─────────────────────────────────────────────────────────────
 
@@ -4431,6 +4519,8 @@ class BrowserView(QWebEngineView):
         act_save = page.action(WA.SavePage)
         act_save.setText("💾  Salva pagina")
         menu.addAction(act_save)
+        act_screenshot = menu.addAction("📸  Screenshot pagina  Stamp")
+        act_screenshot.triggered.connect(self.take_screenshot)
         menu.addSeparator()
         act_source = menu.addAction("👁  Visualizza sorgente  Ctrl+U")
         act_source.triggered.connect(self.open_source_viewer)
@@ -4448,6 +4538,34 @@ class BrowserView(QWebEngineView):
         from calnav_source_viewer import SourceViewerDialog
         dlg = SourceViewerDialog(self, parent=self.window())
         dlg.exec()
+
+    def take_screenshot(self):
+        """Capture what's currently rendered in this tab and save it as a PNG.
+
+        Uses QWidget.grab() rather than a full-page capture API (Qt/QtWebEngine
+        exposes none) — it captures the visible viewport, same as pressing
+        Stamp on any other window."""
+        pixmap = self.grab()
+        win = self.window()
+        if pixmap.isNull():
+            if hasattr(win, "statusBar"):
+                win.statusBar().showMessage("❌  Impossibile catturare lo screenshot.", 5000)
+            return
+        download_dir = getattr(win, "_settings", {}).get("download_dir") or _default_download_dir()
+        ts = time.strftime("%Y%m%d-%H%M%S")
+        default_path = str(Path(download_dir) / f"CalNav-screenshot-{ts}.png")
+        path, _filt = QFileDialog.getSaveFileName(
+            win, "Salva screenshot", default_path, "Immagine PNG (*.png)")
+        if not path:
+            return
+        if not path.lower().endswith(".png"):
+            path += ".png"
+        ok = pixmap.save(path, "PNG")
+        if hasattr(win, "statusBar"):
+            if ok:
+                win.statusBar().showMessage(f"📸  Screenshot salvato in {path}", 5000)
+            else:
+                win.statusBar().showMessage("❌  Impossibile salvare lo screenshot.", 5000)
 
 
 # ── Main window ───────────────────────────────────────────────────────────────
@@ -4872,6 +4990,7 @@ class CalNavWindow(QMainWindow):
         QShortcut(QKeySequence("Ctrl+I"),         self, self._toggle_ie_mode)
         QShortcut(QKeySequence("F12"),            self, self._open_devtools)
         QShortcut(QKeySequence("Ctrl+U"),         self, lambda: self.webview.open_source_viewer() if self.webview else None)
+        QShortcut(QKeySequence("Print"),          self, lambda: self.webview.take_screenshot() if self.webview else None)
         QShortcut(QKeySequence("Ctrl+D"),         self, self._toggle_bookmark)
         QShortcut(QKeySequence("Ctrl+Shift+B"),   self, self._open_bookmarks)
         QShortcut(QKeySequence("Ctrl+Shift+P"),   self, self._open_profile_dialog)
@@ -6162,7 +6281,13 @@ class CalNavWindow(QMainWindow):
     # ── Navigazione ───────────────────────────────────────────────────────────
     def _load_in_view(self, view: QWebEngineView, url: str):
         """Navigate a specific view to url (smart URL / search fallback)."""
-        if not url.startswith(("http://", "https://", "file://")):
+        # Chromium/QtWebEngine internal pages (chrome://gpu, chrome://version,
+        # chrome://net-internals, …) and other browser-native schemes have no
+        # "." in them, so without this they'd fall into the search-query
+        # branch below and get typed into Google instead of navigated to.
+        if url.startswith(("chrome://", "chrome-error://", "about:", "qrc:", "data:")):
+            pass
+        elif not url.startswith(("http://", "https://", "file://")):
             if "." in url and " " not in url:
                 url = "https://" + url
             else:
@@ -6316,6 +6441,14 @@ def _hide_console():
 def main():
     # ── Hide console window immediately (before QApplication) ─────────────────
     _hide_console()
+
+    # QtWebEngine's own docs require this attribute to be set on QApplication
+    # BEFORE it's constructed: without it, the OpenGL context each
+    # QWebEngineView renders into isn't reliably shared with the rest of the
+    # app, which shows up as Chromium's "checkerboard" placeholder tiles
+    # (visible on graphics-heavy pages) and stutter that looks like the page
+    # keeps half-refreshing — worse the more tabs/views are open at once.
+    QApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts, True)
 
     # ── Suppress Qt/Chromium noise before anything else ───────────────────────
     _suppress_qt_warnings()
