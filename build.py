@@ -21,14 +21,16 @@ if hasattr(sys.stdout, "reconfigure"):
 # -- Configurazione ------------------------------------------------------------
 ROOT        = Path(__file__).parent.resolve()
 APP_NAME    = "CalNav"
-APP_VERSION = "1.1.40-alpha"
+APP_VERSION = "1.1.41-alpha"
 # Keep in sync with RUNTIME_VERSION in calnav.py — bump ONLY when PyQt6/Qt or
 # the vendor/ payloads change. Lets the auto-updater ship a ~2 MB CalNav.exe
 # swap instead of a full reinstall when just our own code changed.
-# (Bumped to 2 for 1.1.31, then 3 for 1.1.33, then 4 for 1.1.35, each forcing
-# a one-time full reinstall past a bug in the fast-path swap script — see
-# calnav.py.)
-RUNTIME_VERSION = 4
+# (Bumped to 2 for 1.1.31, then 3 for 1.1.33, then 4 for 1.1.35, then 5 for
+# 1.1.41 — v1.1.40 shipped with PyQt6.QtQuick used but excluded from the
+# PyInstaller build, crashing on launch; affected installs' runtime folder
+# has no Qt6Quick/Qt6Qml DLLs at all, so this forces the full installer
+# once more instead of a fast swap onto a runtime still missing them.)
+RUNTIME_VERSION = 5
 ICON_FILE   = ROOT / "logo_browser.ico"
 DIST_DIR    = ROOT / "dist"
 BUILD_DIR   = ROOT / "build"
@@ -185,6 +187,17 @@ def build_exe():
         "--hidden-import", "cryptography",
         "--hidden-import", "cryptography.fernet",
         "--hidden-import", "cryptography.hazmat.primitives.kdf.pbkdf2",
+        # QtQuick itself is needed at runtime for QQuickWindow.setGraphicsApi()
+        # (forces the RHI backend QtWebEngine's compositor shares with Qt —
+        # see the comment at that call site in calnav.py). No QML/.qml files
+        # are ever loaded, but PyQt6.QtQuick's own compiled bindings import
+        # PyQt6.QtQml as a transitive dependency regardless (confirmed: with
+        # QtQml excluded, PyQt6.QtQuick still fails ModuleNotFoundError on
+        # PyQt6.QtQml) — so both have to ship, even though we never touch
+        # QtQml ourselves. QtQuick3D/QtQuickWidgets stay excluded (unrelated
+        # to either).
+        "--hidden-import", "PyQt6.QtQuick",
+        "--hidden-import", "PyQt6.QtQml",
 
         # Escludi tutto quello che non serve a un browser
         "--exclude-module", "PyQt6.Qt3DCore",
@@ -193,8 +206,6 @@ def build_exe():
         "--exclude-module", "PyQt6.Qt3DExtras",
         "--exclude-module", "PyQt6.QtMultimedia",
         "--exclude-module", "PyQt6.QtMultimediaWidgets",
-        "--exclude-module", "PyQt6.QtQml",
-        "--exclude-module", "PyQt6.QtQuick",
         "--exclude-module", "PyQt6.QtQuick3D",
         "--exclude-module", "PyQt6.QtQuickWidgets",
         "--exclude-module", "PyQt6.QtBluetooth",

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """CalNav Browser — Modern spirit, classic roots."""
 
-__version__ = "1.1.40-alpha"
+__version__ = "1.1.41-alpha"
 
 # Bumped ONLY when the frozen build's runtime dependencies change (PyQt6 /
 # PyQt6-WebEngine version, or the vendor/ payloads — WebView2Loader.dll,
@@ -32,7 +32,16 @@ __version__ = "1.1.40-alpha"
 # closed and never came back. Same self-defeating bootstrap problem as
 # before — the broken code is what would be doing the swapping — so force
 # the full installer once more; script is now BOM-encoded (utf-8-sig).
-RUNTIME_VERSION = 4
+#
+# Bumped to 5 for 1.1.41: v1.1.40 shipped a hard crash on launch — a
+# concurrent edit added PyQt6.QtQuick usage (QQuickWindow.setGraphicsApi,
+# an attempted fix for GPU compositing) that build.py's PyInstaller
+# excludes stripped out, so the frozen exe died with ModuleNotFoundError
+# before the window ever opened. v1.1.40 went out via the fast path, so
+# affected installs have a runtime/_internal folder with no Qt6Quick/
+# Qt6Qml DLLs at all — another fast swap would just crash the same way.
+# Forces the full installer so the corrected vendor runtime actually lands.
+RUNTIME_VERSION = 5
 
 import json
 import math
