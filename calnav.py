@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """CalNav Browser — Modern spirit, classic roots."""
 
-__version__ = "1.1.34-alpha"
+__version__ = "1.1.35-alpha"
 
 # Bumped ONLY when the frozen build's runtime dependencies change (PyQt6 /
 # PyQt6-WebEngine version, or the vendor/ payloads — WebView2Loader.dll,
@@ -22,7 +22,17 @@ __version__ = "1.1.34-alpha"
 # the fast path a second time in a row on a real user's machine, force the
 # proven full-installer path once more here too; fast path can go back to
 # being exercised normally starting from whatever release follows this one.
-RUNTIME_VERSION = 3
+#
+# Bumped to 4 for 1.1.35: the fast path's generated .ps1 was written as plain
+# UTF-8 with no BOM. Windows PowerShell 5.1 (powershell.exe) reads a script
+# file with no BOM using the system's ANSI code page, not UTF-8 — so a single
+# non-ASCII character anywhere in it (here, an em-dash in a log message)
+# silently corrupted the parse and the WHOLE script failed before running a
+# single line: no log ever written, no window (hidden by design), app just
+# closed and never came back. Same self-defeating bootstrap problem as
+# before — the broken code is what would be doing the swapping — so force
+# the full installer once more; script is now BOM-encoded (utf-8-sig).
+RUNTIME_VERSION = 4
 
 import json
 import math
@@ -3281,12 +3291,22 @@ for ($i = 0; $i -lt 30; $i++) {{
     }}
 }}
 if (-not $succeeded) {{
-    "swap FAILED after all retries — relaunching unchanged exe" | Out-File -FilePath '{log_path}' -Append -Encoding utf8
+    "swap FAILED after all retries - relaunching unchanged exe" | Out-File -FilePath '{log_path}' -Append -Encoding utf8
 }}
 Start-Process -FilePath '{target_exe}'
 """
         try:
-            with open(script_path, "w", encoding="utf-8") as f:
+            # Windows PowerShell 5.1 (powershell.exe, as opposed to PowerShell 7's
+            # pwsh.exe) reads a .ps1 file using the system's ANSI code page unless
+            # it starts with a UTF-8 BOM — plain "utf-8" has none, so any non-ASCII
+            # byte sequence (even something as innocuous as an em-dash) is
+            # misread, corrupting a string literal and failing the WHOLE script
+            # to parse before a single line runs. That silently broke every fast
+            # update: no log ever got written (parsing fails before the first
+            # Out-File), no window flashed (hidden by design), and the app just
+            # closed and never came back. utf-8-sig writes the BOM so this can't
+            # recur even if a future edit reintroduces a non-ASCII character.
+            with open(script_path, "w", encoding="utf-8-sig") as f:
                 f.write(script)
         except OSError as e:
             self._set_error(f"❌  Preparazione aggiornamento fallita: {str(e)[:80]}")
