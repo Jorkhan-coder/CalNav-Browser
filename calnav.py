@@ -1,14 +1,21 @@
 #!/usr/bin/env python3
 """CalNav Browser — Modern spirit, classic roots."""
 
-__version__ = "1.1.30-alpha"
+__version__ = "1.1.31-alpha"
 
 # Bumped ONLY when the frozen build's runtime dependencies change (PyQt6 /
 # PyQt6-WebEngine version, or the vendor/ payloads — WebView2Loader.dll,
 # WebPlugins). Used by the auto-updater to decide whether a new release can
 # use the fast path (swap the ~2 MB CalNav.exe in place) or needs the full
 # ~150 MB reinstall (runtime itself changed). Keep in sync with build.py.
-RUNTIME_VERSION = 1
+#
+# Bumped to 2 for 1.1.31 specifically to force every older client through
+# the full reinstall ONE more time: 1.1.28/1.1.29/1.1.30 have a bug in the
+# fast-path swap script itself (it checked success with Test-Path, which is
+# true even when the delete/replace silently failed — so it always "worked"
+# instantly and relaunched the untouched OLD exe). The fast path can't fix
+# itself, since the broken code is what would be doing the swapping.
+RUNTIME_VERSION = 2
 
 import json
 import math
@@ -3205,15 +3212,36 @@ class UpdateBar(QWidget):
         target_exe = sys.executable   # the currently running CalNav.exe
         pid = _os.getpid()
         script_path = _os.path.join(tempfile.gettempdir(), "calnav_fast_update.ps1")
+        log_path = _os.path.join(tempfile.gettempdir(), "calnav_fast_update.log")
+        # NOTE: the previous version of this script checked success with
+        # `Test-Path target_exe` after the swap attempt — which is ALWAYS
+        # true (the old file is still sitting right there if Remove-Item
+        # silently failed), so it always "succeeded" on the very first loop
+        # iteration regardless of whether anything was actually replaced.
+        # That's exactly why the update looked instant, closed/reopened the
+        # app, and yet kept relaunching the untouched old exe every time.
+        # Fix: only trust Move-Item's own success/failure (via -ErrorAction
+        # Stop + try/catch), and actually retry on failure.
         script = f"""
-$ErrorActionPreference = 'SilentlyContinue'
+$ErrorActionPreference = 'Stop'
+"" | Out-File -FilePath '{log_path}' -Encoding utf8
 try {{ Wait-Process -Id {pid} -Timeout 15 }} catch {{}}
-Start-Sleep -Milliseconds 400
-for ($i = 0; $i -lt 25; $i++) {{
-    Remove-Item -LiteralPath '{target_exe}' -Force
-    Move-Item -LiteralPath '{self._installer_path}' -Destination '{target_exe}' -Force
-    if (Test-Path -LiteralPath '{target_exe}') {{ break }}
-    Start-Sleep -Milliseconds 400
+Start-Sleep -Milliseconds 500
+$succeeded = $false
+for ($i = 0; $i -lt 30; $i++) {{
+    try {{
+        Remove-Item -LiteralPath '{target_exe}' -Force -ErrorAction Stop
+        Move-Item -LiteralPath '{self._installer_path}' -Destination '{target_exe}' -Force -ErrorAction Stop
+        $succeeded = $true
+        "swap succeeded on attempt $i" | Out-File -FilePath '{log_path}' -Append -Encoding utf8
+        break
+    }} catch {{
+        "attempt $i failed: $_" | Out-File -FilePath '{log_path}' -Append -Encoding utf8
+        Start-Sleep -Milliseconds 500
+    }}
+}}
+if (-not $succeeded) {{
+    "swap FAILED after all retries — relaunching unchanged exe" | Out-File -FilePath '{log_path}' -Append -Encoding utf8
 }}
 Start-Process -FilePath '{target_exe}'
 """

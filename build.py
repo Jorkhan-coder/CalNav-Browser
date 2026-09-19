@@ -21,11 +21,13 @@ if hasattr(sys.stdout, "reconfigure"):
 # -- Configurazione ------------------------------------------------------------
 ROOT        = Path(__file__).parent.resolve()
 APP_NAME    = "CalNav"
-APP_VERSION = "1.1.30-alpha"
+APP_VERSION = "1.1.31-alpha"
 # Keep in sync with RUNTIME_VERSION in calnav.py — bump ONLY when PyQt6/Qt or
 # the vendor/ payloads change. Lets the auto-updater ship a ~2 MB CalNav.exe
 # swap instead of a full reinstall when just our own code changed.
-RUNTIME_VERSION = 1
+# (Bumped to 2 for 1.1.31 to force a one-time full reinstall past a bug in
+# the fast-path swap script itself — see the matching comment in calnav.py.)
+RUNTIME_VERSION = 2
 ICON_FILE   = ROOT / "logo_browser.ico"
 DIST_DIR    = ROOT / "dist"
 BUILD_DIR   = ROOT / "build"
