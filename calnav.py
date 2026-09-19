@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """CalNav Browser — Modern spirit, classic roots."""
 
-__version__ = "1.1.31-alpha"
+__version__ = "1.1.32-alpha"
 
 # Bumped ONLY when the frozen build's runtime dependencies change (PyQt6 /
 # PyQt6-WebEngine version, or the vendor/ payloads — WebView2Loader.dll,
@@ -2943,6 +2943,15 @@ class CodecEngineBar(QWidget):
 class UpdateBar(QWidget):
     """Notification bar: detects new version and auto-installs it via pip."""
 
+    # Emitted right before this process is torn down to relaunch as the new
+    # version — lets CalNavWindow close secondary top-level windows first
+    # (IEEngineWindow / WebView2EngineWindow keep their own COM/WebView2
+    # resources alive independently of this bar; giving them a clean
+    # closeEvent instead of yanking the whole process down with them still
+    # open makes the exit — and the fast-update swap that follows it —
+    # more reliable).
+    about_to_relaunch = pyqtSignal()
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self._process: QProcess | None = None
@@ -3184,6 +3193,7 @@ class UpdateBar(QWidget):
         'runas' (CreateProcess/subprocess would fail with "requires elevation").
         """
         import ctypes, os as _os
+        self.about_to_relaunch.emit()
         params = ("/SILENT /SUPPRESSMSGBOXES /CLOSEAPPLICATIONS "
                   "/RESTARTAPPLICATIONS /NORESTART")
         try:
@@ -3209,6 +3219,7 @@ class UpdateBar(QWidget):
         """
         import ctypes, os as _os, tempfile
 
+        self.about_to_relaunch.emit()
         target_exe = sys.executable   # the currently running CalNav.exe
         pid = _os.getpid()
         script_path = _os.path.join(tempfile.gettempdir(), "calnav_fast_update.ps1")
@@ -5671,6 +5682,7 @@ class CalNavWindow(QMainWindow):
         vbox.addWidget(self._build_progress_bar())
 
         self._update_bar = UpdateBar()
+        self._update_bar.about_to_relaunch.connect(self._close_secondary_engine_windows)
         vbox.addWidget(self._update_bar)
 
         self._save_bar = SavePasswordBar()
@@ -6000,6 +6012,25 @@ class CalNavWindow(QMainWindow):
         act_edge.triggered.connect(self._open_webview2_engine_window)
 
         menu.exec(self.btn_ie.mapToGlobal(pos))
+
+    def _close_secondary_engine_windows(self):
+        """Close every open IEEngineWindow/WebView2EngineWindow before this
+        process relaunches for an update.
+
+        These are independent top-level windows holding their own COM/
+        WebView2 resources (ActiveX control, or an out-of-process Edge
+        controller); left open, they don't stop the main window from
+        closing, but they can leave things half-torn-down under the hood
+        when the whole process is then yanked down with _os._exit(0),
+        which in turn can make the update's file-swap step less reliable
+        right after (observed: a Twitch tab left open in the real-Edge
+        engine window during an update, then a swap failure)."""
+        for win in list(self._ie_windows):
+            try:
+                win.close()
+            except Exception:
+                pass
+        self._ie_windows.clear()
 
     def _open_ie_engine_window(self, url: str = ""):
         """Open the current page embedded in the real IE/MSHTML engine (ActiveX)."""
