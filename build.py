@@ -25,9 +25,9 @@ APP_VERSION = "1.1.33-alpha"
 # Keep in sync with RUNTIME_VERSION in calnav.py — bump ONLY when PyQt6/Qt or
 # the vendor/ payloads change. Lets the auto-updater ship a ~2 MB CalNav.exe
 # swap instead of a full reinstall when just our own code changed.
-# (Bumped to 2 for 1.1.31 to force a one-time full reinstall past a bug in
-# the fast-path swap script itself — see the matching comment in calnav.py.)
-RUNTIME_VERSION = 2
+# (Bumped to 2 for 1.1.31, then 3 for 1.1.33, each forcing a one-time full
+# reinstall past a bug in the fast-path swap script — see calnav.py.)
+RUNTIME_VERSION = 3
 ICON_FILE   = ROOT / "logo_browser.ico"
 DIST_DIR    = ROOT / "dist"
 BUILD_DIR   = ROOT / "build"

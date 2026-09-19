@@ -15,7 +15,14 @@ __version__ = "1.1.33-alpha"
 # true even when the delete/replace silently failed — so it always "worked"
 # instantly and relaunched the untouched OLD exe). The fast path can't fix
 # itself, since the broken code is what would be doing the swapping.
-RUNTIME_VERSION = 2
+#
+# Bumped to 3 for 1.1.33: the fast path's log/script also had a location bug
+# (per-user %TEMP%, invisible across a UAC elevation that runs as a
+# different account — fixed by moving to %ProgramData%). Rather than trust
+# the fast path a second time in a row on a real user's machine, force the
+# proven full-installer path once more here too; fast path can go back to
+# being exercised normally starting from whatever release follows this one.
+RUNTIME_VERSION = 3
 
 import json
 import math
