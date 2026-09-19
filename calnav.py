@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """CalNav Browser — Modern spirit, classic roots."""
 
-__version__ = "1.1.38-alpha"
+__version__ = "1.1.39-alpha"
 
 # Bumped ONLY when the frozen build's runtime dependencies change (PyQt6 /
 # PyQt6-WebEngine version, or the vendor/ payloads — WebView2Loader.dll,
@@ -5307,8 +5307,15 @@ class CalNavWindow(QMainWindow):
             self._load_in_view(view, url)
 
         if activate and focus_address_bar:
-            # Deferred so it runs after the tab-switch/url-changed handlers
-            # above finish updating the address bar text.
+            # address_bar.setText() (in _on_url_changed, fired once this
+            # view's navigation actually starts) resets any selection — and
+            # since that can land well after a fixed timer on a slow page,
+            # a plain QTimer.singleShot(0, ...) sometimes lost the race and
+            # the selection got silently wiped. Selecting once more right
+            # after THIS view's next url change guarantees correct ordering
+            # regardless of timing; the immediate call below just makes an
+            # already-loaded/instant case (e.g. blank homepage) feel snappy.
+            view._calnav_focus_addr_pending = True
             QTimer.singleShot(0, self._focus_address_bar)
 
         return view
@@ -6316,6 +6323,9 @@ class CalNavWindow(QMainWindow):
             u = url.toString()
             if u != "about:blank":
                 self.address_bar.setText(u)
+                if getattr(view, "_calnav_focus_addr_pending", False):
+                    view._calnav_focus_addr_pending = False
+                    self._focus_address_bar()
             h = view.history()
             self.btn_back.setEnabled(h.canGoBack())
             self.btn_forward.setEnabled(h.canGoForward())
@@ -6449,6 +6459,21 @@ def main():
     # (visible on graphics-heavy pages) and stutter that looks like the page
     # keeps half-refreshing — worse the more tabs/views are open at once.
     QApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts, True)
+
+    # Confirmed report: checkerboarding/tearing happens ONLY in CalNav, never
+    # in Chrome/Edge on the same PC, on a 4K monitor running Windows' 150%
+    # scaling (two monitors). 150% is a *fractional* DPI factor (not 100%/
+    # 200%), and Qt6's default HighDpiScaleFactorRoundingPolicy rounds that
+    # to the nearest whole factor before handing it to QtWebEngine — so the
+    # Chromium surface renders at a device-pixel-ratio that doesn't match
+    # what Windows actually composites, forcing constant surface
+    # reallocation/rescaling and producing exactly this artifact. PassThrough
+    # uses the real 1.5x factor instead of rounding it away. Chrome/Edge
+    # don't have this problem because they handle fractional scaling
+    # natively rather than through Qt's rounding layer.
+    QApplication.setHighDpiScaleFactorRoundingPolicy(
+        Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
+    )
 
     # ── Suppress Qt/Chromium noise before anything else ───────────────────────
     _suppress_qt_warnings()
