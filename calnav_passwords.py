@@ -100,6 +100,9 @@ class PasswordManager:
         self._profile = profile_name
         self._fernet = None
         self._entries: List[Dict] = []
+        # Categories that exist even with zero entries in them (created via
+        # "Nuova categoria" in the vault before any password is filed there).
+        self._categories: set = set()
         self._ignored_hosts: set = set()
         if _CRYPTO_OK:
             self._fernet = Fernet(_derive_key(profile_name))
@@ -111,20 +114,30 @@ class PasswordManager:
     def _load(self):
         if not self._file.exists() or not _CRYPTO_OK or not self._fernet:
             self._entries = []
+            self._categories = set()
             return
         try:
             raw = self._fernet.decrypt(self._file.read_bytes())
-            self._entries = json.loads(raw.decode())
+            data = json.loads(raw.decode())
+            if isinstance(data, list):
+                # Pre-categories-feature format: bare list of entries.
+                self._entries = data
+                self._categories = set()
+            else:
+                self._entries = data.get("entries", [])
+                self._categories = set(data.get("categories", []))
             # Back-fill category for entries saved before this feature
             for e in self._entries:
                 e.setdefault("category", DEFAULT_CATEGORY)
         except Exception:
             self._entries = []
+            self._categories = set()
 
     def _save(self):
         if not _CRYPTO_OK or not self._fernet:
             return
-        raw = json.dumps(self._entries, ensure_ascii=False).encode()
+        data = {"entries": self._entries, "categories": sorted(self._categories)}
+        raw = json.dumps(data, ensure_ascii=False).encode()
         self._file.parent.mkdir(parents=True, exist_ok=True)
         self._file.write_bytes(self._fernet.encrypt(raw))
 
@@ -219,14 +232,28 @@ class PasswordManager:
     # ── Categories ────────────────────────────────────────────────────────────
 
     def categories(self) -> List[str]:
-        """Sorted list of unique category names present in the vault."""
-        return sorted({e.get("category", DEFAULT_CATEGORY) for e in self._entries})
+        """Sorted list of unique category names — includes empty ones
+        created via add_category(), not just ones with entries in them."""
+        names = set(self._categories)
+        names.update(e.get("category", DEFAULT_CATEGORY) for e in self._entries)
+        return sorted(names)
+
+    def add_category(self, name: str):
+        """Create a category with zero entries so it shows up in the vault
+        right away, before the first password is filed under it."""
+        name = name.strip()
+        if name and name != DEFAULT_CATEGORY and name not in self._categories:
+            self._categories.add(name)
+            self._save()
 
     def rename_category(self, old_name: str, new_name: str):
         new_name = new_name.strip() or DEFAULT_CATEGORY
         for e in self._entries:
             if e.get("category", DEFAULT_CATEGORY) == old_name:
                 e["category"] = new_name
+        if old_name in self._categories:
+            self._categories.discard(old_name)
+            self._categories.add(new_name)
         self._save()
 
     def delete_category(self, name: str):
@@ -234,6 +261,7 @@ class PasswordManager:
         for e in self._entries:
             if e.get("category", DEFAULT_CATEGORY) == name:
                 e["category"] = DEFAULT_CATEGORY
+        self._categories.discard(name)
         self._save()
 
     # ── Search ────────────────────────────────────────────────────────────────

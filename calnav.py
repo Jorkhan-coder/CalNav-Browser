@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """CalNav Browser — Modern spirit, classic roots."""
 
-__version__ = "1.1.29-alpha"
+__version__ = "1.1.30-alpha"
 
 # Bumped ONLY when the frozen build's runtime dependencies change (PyQt6 /
 # PyQt6-WebEngine version, or the vendor/ payloads — WebView2Loader.dll,
@@ -268,7 +268,16 @@ DETECT_FORMS_JS = """
         var bridge = channel.objects.calnav_bridge;
         if (!bridge) return;
 
-        function getUserField(form) {
+        // Last non-empty username/password pair seen anywhere on the page —
+        // kept up to date on every keystroke (see the 'input' listener
+        // below), not just on a real <form> submit. Many modern login
+        // screens are plain divs with a JS click handler doing fetch()/XHR,
+        // so a real 'submit' event never fires; tracking field values
+        // continuously plus offering on 'beforeunload' (the page navigating
+        // away after a successful login) catches those too.
+        var lastCreds = null;
+
+        function getUserField(scope) {
             var selectors = [
                 'input[type="email"]',
                 'input[autocomplete="username"]',
@@ -282,29 +291,50 @@ DETECT_FORMS_JS = """
                 'input[type="text"]'
             ];
             for (var i = 0; i < selectors.length; i++) {
-                var el = form.querySelector(selectors[i]);
+                var el = scope.querySelector(selectors[i]);
                 if (el && el.value) return el;
             }
             return null;
         }
 
+        function captureCreds(scope) {
+            var pw = scope.querySelector('input[type="password"]');
+            if (!pw || !pw.value) return;
+            var usr = getUserField(scope);
+            if (usr && usr.value) {
+                lastCreds = { url: location.href, username: usr.value, password: pw.value };
+            }
+        }
+
+        function offerNow(scope) {
+            captureCreds(scope || document);
+            if (lastCreds) {
+                try { bridge.offer_save_password(lastCreds.url, lastCreds.username, lastCreds.password); }
+                catch(e) {}
+                lastCreds = null;
+            }
+        }
+
         function watchForm(form) {
             if (form._cnWatched) return;
             form._cnWatched = true;
-            form.addEventListener('submit', function() {
-                var pw = form.querySelector('input[type="password"]');
-                if (!pw || !pw.value) return;
-                var usr = getUserField(form);
-                if (usr && usr.value) {
-                    try { bridge.offer_save_password(location.href, usr.value, pw.value); }
-                    catch(e) {}
-                }
-            }, true);
+            form.addEventListener('submit', function() { offerNow(form); }, true);
         }
 
         function scanForms() {
             document.querySelectorAll('form').forEach(watchForm);
         }
+
+        document.addEventListener('input', function(ev) {
+            var el = ev.target;
+            if (!el || el.tagName !== 'INPUT') return;
+            if (['password', 'email', 'text'].indexOf(el.type) === -1) return;
+            captureCreds(el.closest('form') || document);
+        }, true);
+
+        // Successful AJAX-style logins usually redirect or reload shortly
+        // after — that is the moment to offer saving whatever was captured.
+        window.addEventListener('beforeunload', function() { offerNow(); });
 
         if (document.readyState !== 'loading') {
             scanForms();
@@ -1181,15 +1211,19 @@ class PasswordGeneratorDialog(QDialog):
 
 # ── Edit password entry dialog ────────────────────────────────────────────────
 class EditPasswordEntryDialog(QDialog):
-    """Edit username, password and category of a saved credential."""
+    """Edit username, password and category of a saved credential — or, when
+    entry is None, create a brand new one (the vault has no other way to add
+    a password manually, only via the on-page save-prompt)."""
 
-    def __init__(self, entry: dict, categories: list, pm, parent=None):
+    def __init__(self, entry: Optional[dict], categories: list, pm, parent=None):
         super().__init__(parent)
-        self._entry = entry
+        self._is_new = entry is None
+        self._entry = dict(entry) if entry else {}
         self._pm = pm
         self._all_cats = categories
-        self.setWindowTitle("Modifica credenziale — CalNav")
-        self.setFixedSize(400, 280)
+        self.setWindowTitle("Nuova credenziale — CalNav" if self._is_new
+                             else "Modifica credenziale — CalNav")
+        self.setFixedSize(400, 320 if self._is_new else 280)
         self.setStyleSheet(f"background: {NAVY_MID}; color: {TEXT_BRIGHT};")
         self._build()
 
@@ -1198,7 +1232,8 @@ class EditPasswordEntryDialog(QDialog):
         vbox.setContentsMargins(24, 20, 24, 18)
         vbox.setSpacing(10)
 
-        hdr = QLabel(f"  {self._entry.get('host', '')}")
+        hdr = QLabel("  Nuova credenziale" if self._is_new
+                      else f"  {self._entry.get('host', '')}")
         hdr.setFont(QFont("Segoe UI", 12, QFont.Weight.Bold))
         hdr.setStyleSheet(f"color: {TEAL};")
         vbox.addWidget(hdr)
@@ -1211,6 +1246,12 @@ class EditPasswordEntryDialog(QDialog):
         """
         form = QFormLayout()
         form.setSpacing(8)
+
+        if self._is_new:
+            self._site = QLineEdit()
+            self._site.setPlaceholderText("es. esempio.com")
+            self._site.setStyleSheet(_field_ss)
+            form.addRow("Sito:", self._site)
 
         self._usr = QLineEdit(self._entry.get("username", ""))
         self._usr.setStyleSheet(_field_ss)
@@ -1299,12 +1340,21 @@ class EditPasswordEntryDialog(QDialog):
         new_cat = self._cat_combo.currentText().strip() or "Generale"
         if not new_usr:
             return
-        self._pm.update_entry(
-            self._entry["host"], self._entry["username"],
-            new_username=new_usr,
-            new_password=new_pw if new_pw else None,
-            new_category=new_cat,
-        )
+
+        if self._is_new:
+            site = self._site.text().strip()
+            if not site or not new_pw:
+                return
+            if not site.startswith(("http://", "https://")):
+                site = "https://" + site
+            self._pm.save(site, new_usr, new_pw, category=new_cat)
+        else:
+            self._pm.update_entry(
+                self._entry["host"], self._entry["username"],
+                new_username=new_usr,
+                new_password=new_pw if new_pw else None,
+                new_category=new_cat,
+            )
         self.accept()
 
 
@@ -1447,6 +1497,13 @@ class PasswordVaultDialog(QDialog):
         root.addWidget(splitter, stretch=1)
 
         bot = QHBoxLayout()
+        btn_add = QPushButton("＋  Nuova password")
+        btn_add.setFixedHeight(36)
+        btn_add.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_add.setStyleSheet(self._BTN_TEAL)
+        btn_add.clicked.connect(self._add_entry)
+        bot.addWidget(btn_add)
+
         btn_gen = QPushButton("\U0001f3b2  Genera password")
         btn_gen.setFixedHeight(36)
         btn_gen.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -1522,6 +1579,7 @@ class PasswordVaultDialog(QDialog):
     def _new_category(self):
         name, ok = QInputDialog.getText(self, "Nuova categoria", "Nome categoria:")
         if ok and name.strip():
+            self.pm.add_category(name.strip())
             self._current_category = name.strip()
             self._rebuild_categories()
 
@@ -1629,6 +1687,13 @@ class PasswordVaultDialog(QDialog):
     def _edit_entry(self, entry: dict):
         cats = self.pm.categories() or ["Generale"]
         dlg = EditPasswordEntryDialog(entry, cats, self.pm, self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self._rebuild_categories()
+            self._refresh_table()
+
+    def _add_entry(self):
+        cats = self.pm.categories() or ["Generale"]
+        dlg = EditPasswordEntryDialog(None, cats, self.pm, self)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             self._rebuild_categories()
             self._refresh_table()
@@ -4682,7 +4747,7 @@ class CalNavWindow(QMainWindow):
         QShortcut(QKeySequence("Ctrl+P"),         self, self._open_print_preview)
         QShortcut(QKeySequence("Ctrl+,"),         self, self._open_settings)
         # Tab management
-        QShortcut(QKeySequence("Ctrl+T"),         self, lambda: self._new_tab(self._settings["homepage"]))
+        QShortcut(QKeySequence("Ctrl+T"),         self, lambda: self._new_tab(self._settings["homepage"], focus_address_bar=True))
         QShortcut(QKeySequence("Ctrl+W"),         self, lambda: self._close_tab(self._tab_widget.currentIndex()))
         QShortcut(QKeySequence("Ctrl+Tab"),       self, self._next_tab)
         QShortcut(QKeySequence("Ctrl+Shift+Tab"), self, self._prev_tab)
@@ -4930,7 +4995,7 @@ class CalNavWindow(QMainWindow):
         self._tab_bar.setTabButton(idx, QTabBar.ButtonPosition.LeftSide, None)
 
     def _new_tab(self, url: str = "", group_id: Optional[str] = None,
-                 activate: bool = True) -> QWebEngineView:
+                 activate: bool = True, focus_address_bar: bool = False) -> QWebEngineView:
         """Create a new tab with its own page, optionally in a group."""
         view = BrowserView()
         page = QWebEnginePage(self._web_profile, view)
@@ -4989,6 +5054,11 @@ class CalNavWindow(QMainWindow):
 
         if url:
             self._load_in_view(view, url)
+
+        if activate and focus_address_bar:
+            # Deferred so it runs after the tab-switch/url-changed handlers
+            # above finish updating the address bar text.
+            QTimer.singleShot(0, self._focus_address_bar)
 
         return view
 
@@ -5778,7 +5848,7 @@ class CalNavWindow(QMainWindow):
         self._tab_bar.group_header_clicked.connect(self._toggle_group_collapse)
         # "+" pseudo-tab emits this signal when clicked (see _ensure_plus_tab)
         self._tab_bar.new_tab_requested.connect(
-            lambda: self._new_tab(self._settings["homepage"])
+            lambda: self._new_tab(self._settings["homepage"], focus_address_bar=True)
         )
         # Rebuild header positions after drag-and-drop reorder.
         # tabs_reordered fires in mouseReleaseEvent (not tabMoved), so Qt's
