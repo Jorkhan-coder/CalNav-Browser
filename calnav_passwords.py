@@ -87,7 +87,9 @@ def _host(url: str) -> str:
     try:
         p = urlparse(url)
         h = p.netloc or p.path
-        return h.removeprefix("www.").lower().split(":")[0]
+        # Lowercase BEFORE stripping "www." — removeprefix is case-sensitive,
+        # so "WWW.example.com" and "www.example.com" must normalize the same.
+        return h.lower().removeprefix("www.").split(":")[0]
     except Exception:
         return url.lower()
 
@@ -214,6 +216,24 @@ class PasswordManager:
     def get(self, url: str) -> List[Dict]:
         """Return all entries matching the given URL's host."""
         return [e for e in self._entries if e["host"] == _host(url)]
+
+    def match_status(self, url: str, username: str, password: str) -> str:
+        """Compare (url, username, password) against what's stored for this
+        host+username. Returns:
+          - "new"       → no entry for this host+username yet
+          - "same"      → an entry exists and the password is identical
+          - "different" → an entry exists but the password has changed
+
+        Comparison strips surrounding whitespace on both sides, so an
+        invisible trailing space (autofill/copy-paste artifact) doesn't
+        make an identical-looking password look "different"."""
+        host = _host(url)
+        u = username.strip()
+        p = password.strip()
+        for e in self._entries:
+            if e["host"] == host and e["username"].strip() == u:
+                return "same" if e["password"].strip() == p else "different"
+        return "new"
 
     def all_entries(self) -> List[Dict]:
         return list(self._entries)

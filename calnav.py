@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """CalNav Browser — Modern spirit, classic roots."""
 
-__version__ = "1.1.41-alpha"
+__version__ = "1.1.42-alpha"
 
 # Bumped ONLY when the frozen build's runtime dependencies change (PyQt6 /
 # PyQt6-WebEngine version, or the vendor/ payloads — WebView2Loader.dll,
@@ -54,6 +54,8 @@ from pathlib import Path
 
 from typing import List, Optional
 
+from datetime import date, datetime, timedelta
+
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QLineEdit, QPushButton, QStatusBar, QProgressBar, QLabel,
@@ -61,7 +63,7 @@ from PyQt6.QtWidgets import (
     QHeaderView, QScrollArea, QMessageBox,
     QTabWidget, QTabBar, QMenu, QColorDialog, QInputDialog, QSlider,
     QSplitter, QListWidget, QListWidgetItem, QCheckBox, QComboBox,
-    QSpinBox, QFormLayout, QFileDialog, QStackedWidget,
+    QSpinBox, QFormLayout, QFileDialog, QStackedWidget, QCompleter,
 )
 from PyQt6.QtQuick import QQuickWindow, QSGRendererInterface
 from PyQt6.QtWebEngineWidgets import QWebEngineView
@@ -72,9 +74,12 @@ from PyQt6.QtWebChannel import QWebChannel
 from PyQt6.QtCore import (
     QUrl, Qt, QObject, pyqtSlot, pyqtSignal, QFile, QIODevice,
     PYQT_VERSION_STR, QT_VERSION_STR, QTimer, QRect, QSize, QProcess,
-    QStandardPaths,
+    QStandardPaths, QModelIndex,
 )
-from PyQt6.QtGui import QFont, QIcon, QKeySequence, QShortcut, QPainter, QColor
+from PyQt6.QtGui import (
+    QFont, QIcon, QKeySequence, QShortcut, QPainter, QColor,
+    QStandardItemModel, QStandardItem,
+)
 from PyQt6.QtNetwork import QNetworkAccessManager, QNetworkRequest
 
 from calnav_ie_host import IEEmbedWidget, IE_AVAILABLE, IE_UNAVAILABLE_REASON
@@ -87,6 +92,7 @@ import calnav_webplugins
 from calnav_profiles import ProfileManager, PROFILE_COLORS, DATA_DIR
 from calnav_passwords import PasswordManager
 from calnav_bookmarks import BookmarkManager, Bookmark, UNCATEGORIZED
+from calnav_history import HistoryManager, Visit
 from calnav_session import TabGroup, SavedTab, SessionManager
 
 HOME_URL = "https://www.google.com"
@@ -849,14 +855,19 @@ class SavePasswordBar(QWidget):
                 QPushButton:hover {{ border-color: {TEAL_DIM}; color: {TEXT_BRIGHT}; }}
             """)
 
-    def offer(self, url: str, username: str, password: str):
+    def offer(self, url: str, username: str, password: str, is_update: bool = False):
         self._url, self._username, self._password = url, username, password
         try:
             from urllib.parse import urlparse
             host = urlparse(url).netloc or url
         except Exception:
             host = url
-        self._msg.setText(f"Salva la password per  {host}  ({username})?")
+        if is_update:
+            self._msg.setText(f"La password per  {host}  ({username})  è cambiata. Aggiornarla?")
+            self._btn_save.setText("Aggiorna")
+        else:
+            self._msg.setText(f"Salva la password per  {host}  ({username})?")
+            self._btn_save.setText("Salva")
         self.show()
 
     def _on_save(self):
@@ -2480,6 +2491,348 @@ class BookmarksDialog(QDialog):
             self._refresh_bookmarks()
 
 
+# ── History dialog — raggruppata per giorno e per sito master ────────────────
+class HistoryDialog(QDialog):
+    navigate = pyqtSignal(str)   # url to open
+
+    _IT_WEEKDAYS = ["Lunedì", "Martedì", "Mercoledì", "Giovedì",
+                    "Venerdì", "Sabato", "Domenica"]
+    _IT_MONTHS = ["gennaio", "febbraio", "marzo", "aprile", "maggio", "giugno",
+                  "luglio", "agosto", "settembre", "ottobre", "novembre", "dicembre"]
+
+    def __init__(self, history_manager: HistoryManager, bookmark_manager: BookmarkManager, parent=None):
+        super().__init__(parent)
+        self._hist = history_manager
+        self._bm = bookmark_manager
+        self._expanded: set = set()   # {(date_key, domain), ...} giorni/siti aperti
+        self.setWindowTitle("Cronologia — CalNav")
+        self.resize(820, 600)
+        self._build()
+
+    def _build(self):
+        self.setStyleSheet(f"background: {NAVY_MID}; color: {TEXT_BRIGHT};")
+        root = QVBoxLayout(self)
+        root.setContentsMargins(16, 16, 16, 12)
+        root.setSpacing(10)
+
+        top = QHBoxLayout()
+        title_lbl = QLabel("\U0001f4dc  Cronologia")
+        title_lbl.setFont(QFont("Segoe UI", 14, QFont.Weight.Bold))
+        title_lbl.setStyleSheet(f"color: {TEXT_BRIGHT}; background: transparent;")
+        top.addWidget(title_lbl)
+        top.addStretch()
+
+        btn_clear_all = QPushButton("🗑  Cancella tutto")
+        btn_clear_all.setFixedHeight(30)
+        btn_clear_all.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_clear_all.setStyleSheet(f"""
+            QPushButton {{ background: transparent; color: {TEXT_DIM};
+                border: 1px solid #253852; border-radius: 8px; padding: 0 14px; font-size: 11px; }}
+            QPushButton:hover {{ border-color: #FF6B6B; color: #FF6B6B; }}
+        """)
+        btn_clear_all.clicked.connect(self._clear_all)
+        top.addWidget(btn_clear_all)
+        root.addLayout(top)
+
+        self._search = QLineEdit()
+        self._search.setPlaceholderText("Cerca nella cronologia…")
+        self._search.setFixedHeight(36)
+        self._search.setStyleSheet(f"""
+            QLineEdit {{ background: {NAVY_LIGHT}; color: {TEXT_BRIGHT};
+                border: 1.5px solid #253852; border-radius: 10px;
+                padding: 0 14px; font-size: 12px; }}
+            QLineEdit:focus {{ border-color: {TEAL}; }}
+        """)
+        self._search.textChanged.connect(self._refresh)
+        root.addWidget(self._search)
+
+        self._list_widget = QWidget()
+        self._list_layout = QVBoxLayout(self._list_widget)
+        self._list_layout.setContentsMargins(0, 0, 4, 0)
+        self._list_layout.setSpacing(16)
+        sc = QScrollArea()
+        sc.setWidgetResizable(True)
+        sc.setWidget(self._list_widget)
+        sc.setStyleSheet("QScrollArea { border: none; background: transparent; }")
+        root.addWidget(sc, stretch=1)
+
+        bottom = QHBoxLayout()
+        bottom.addStretch()
+        btn_close = QPushButton("Chiudi")
+        btn_close.setFixedHeight(34)
+        btn_close.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_close.setStyleSheet(f"""
+            QPushButton {{ background: {TEAL}; color: {NAVY_DEEP}; border: none;
+                border-radius: 8px; padding: 0 24px; font-weight: bold; }}
+            QPushButton:hover {{ background: #33DDFF; }}
+        """)
+        btn_close.clicked.connect(self.accept)
+        bottom.addWidget(btn_close)
+        root.addLayout(bottom)
+
+        self._refresh()
+
+    # ── Rendering ─────────────────────────────────────────────────────────────
+    def _date_label(self, d) -> str:
+        today = date.today()
+        delta = (today - d).days
+        if delta == 0:
+            return "Oggi"
+        if delta == 1:
+            return "Ieri"
+        wd = self._IT_WEEKDAYS[d.weekday()]
+        return f"{wd} {d.day} {self._IT_MONTHS[d.month - 1]} {d.year}"
+
+    def _refresh(self):
+        query = self._search.text().strip()
+
+        while self._list_layout.count():
+            item = self._list_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        chapters = self._hist.grouped_by_day(query)
+
+        if not chapters:
+            empty = QLabel("Nessuna pagina in cronologia." if not query else "Nessun risultato.")
+            empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            empty.setStyleSheet(f"color: {TEXT_DIM}; font-size: 13px; padding: 40px;")
+            self._list_layout.addWidget(empty)
+            self._list_layout.addStretch()
+            return
+
+        if not query:
+            memories = self._hist.on_this_day()
+            if memories:
+                self._list_layout.addWidget(self._make_on_this_day_panel(memories))
+
+        for chapter in chapters:
+            self._list_layout.addWidget(self._make_chapter(chapter))
+
+        self._list_layout.addStretch()
+
+    def _make_on_this_day_panel(self, memories: list) -> QWidget:
+        box = QWidget()
+        box.setStyleSheet(f"""
+            QWidget {{ background: rgba(245,166,35,0.08);
+                border: 1px solid {AMBER_DIM}; border-radius: 10px; }}
+        """)
+        v = QVBoxLayout(box)
+        v.setContentsMargins(12, 10, 12, 10)
+        v.setSpacing(4)
+
+        title = QLabel("🕰  Accadde oggi — negli anni passati")
+        title.setStyleSheet(f"color: {AMBER}; font-size: 12px; font-weight: bold; background: transparent; border: none;")
+        v.addWidget(title)
+
+        by_year: dict = {}
+        for m in memories:
+            by_year.setdefault(m.dt.year, []).append(m)
+
+        today_year = date.today().year
+        for year in sorted(by_year.keys(), reverse=True)[:3]:
+            years_ago = today_year - year
+            lbl = QLabel(f"{years_ago} anno fa" if years_ago == 1 else f"{years_ago} anni fa")
+            lbl.setStyleSheet(f"color: {TEXT_DIM}; font-size: 10px; background: transparent; border: none; margin-top: 4px;")
+            v.addWidget(lbl)
+            for m in by_year[year][:4]:
+                link = QPushButton(f"•  {m.title or m.url}")
+                link.setCursor(Qt.CursorShape.PointingHandCursor)
+                link.setToolTip(m.url)
+                link.setStyleSheet(f"""
+                    QPushButton {{ background: transparent; color: {TEXT_BRIGHT};
+                        border: none; text-align: left; font-size: 11px; padding: 0 0 0 8px; }}
+                    QPushButton:hover {{ color: {AMBER}; text-decoration: underline; }}
+                """)
+                link.clicked.connect(lambda _, u=m.url: self._open_url(u))
+                v.addWidget(link)
+
+        return box
+
+    def _make_chapter(self, chapter: dict) -> QWidget:
+        card = QWidget()
+        v = QVBoxLayout(card)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(6)
+
+        header = QHBoxLayout()
+        cap_lbl = QLabel(f"📅  {self._date_label(chapter['date'])}")
+        cap_lbl.setFont(QFont("Segoe UI", 12, QFont.Weight.Bold))
+        cap_lbl.setStyleSheet(f"color: {TEAL}; background: transparent;")
+        header.addWidget(cap_lbl)
+
+        count_lbl = QLabel(f"{chapter['total']} pagine")
+        count_lbl.setStyleSheet(f"color: {TEXT_DIM}; font-size: 11px; background: transparent;")
+        header.addWidget(count_lbl)
+        header.addStretch()
+
+        btn_del_day = QPushButton("🗑  Cancella giornata")
+        btn_del_day.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_del_day.setFixedHeight(24)
+        btn_del_day.setStyleSheet(f"""
+            QPushButton {{ background: transparent; color: {TEXT_DIM}; border: none; font-size: 10px; }}
+            QPushButton:hover {{ color: #FF6B6B; }}
+        """)
+        btn_del_day.clicked.connect(lambda _, k=chapter["date_key"]: self._delete_day(k))
+        header.addWidget(btn_del_day)
+        v.addLayout(header)
+
+        sep = QWidget()
+        sep.setFixedHeight(1)
+        sep.setStyleSheet(f"background: {TEAL_DIM};")
+        v.addWidget(sep)
+
+        for site in chapter["sites"]:
+            v.addWidget(self._make_site_row(chapter["date_key"], site))
+
+        return card
+
+    def _make_site_row(self, date_key: str, site: dict) -> QWidget:
+        wrap = QWidget()
+        wv = QVBoxLayout(wrap)
+        wv.setContentsMargins(0, 0, 0, 0)
+        wv.setSpacing(4)
+
+        key = (date_key, site["domain"])
+        expanded = key in self._expanded
+
+        row = QWidget()
+        row.setFixedHeight(48)
+        row.setCursor(Qt.CursorShape.PointingHandCursor)
+        row.setStyleSheet(
+            f"QWidget {{ background: {NAVY_DEEP}; border-radius: 10px; border: 1px solid #1C3050; }}"
+        )
+        h = QHBoxLayout(row)
+        h.setContentsMargins(10, 0, 10, 0)
+        h.setSpacing(10)
+
+        chevron = QLabel("▾" if expanded else "▸")
+        chevron.setFixedWidth(14)
+        chevron.setStyleSheet(f"color: {TEAL}; font-size: 12px; background: transparent; border: none;")
+        h.addWidget(chevron)
+
+        example_url = site["last_visit"].url
+        av = QLabel(_url_initial(example_url))
+        av.setFixedSize(30, 30)
+        av.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        av.setStyleSheet(
+            f"background: {_url_color(example_url)}; color: {NAVY_DEEP}; "
+            f"border-radius: 15px; font-weight: bold; font-size: 13px; border: none;"
+        )
+        h.addWidget(av)
+
+        info = QVBoxLayout()
+        info.setSpacing(0)
+        dom_lbl = QLabel(site["domain"] or "?")
+        dom_lbl.setStyleSheet(f"color: {TEXT_BRIGHT}; font-size: 13px; font-weight: bold; background: transparent; border: none;")
+        info.addWidget(dom_lbl)
+        sub_lbl = QLabel(f"{site['count']} visite  ·  ultima alle {site['last_visit'].dt.strftime('%H:%M')}")
+        sub_lbl.setStyleSheet(f"color: {TEXT_DIM}; font-size: 10px; background: transparent; border: none;")
+        info.addWidget(sub_lbl)
+        h.addLayout(info, stretch=1)
+
+        if self._bm.is_bookmarked(example_url):
+            star = QLabel("★")
+            star.setToolTip("Questo sito è nei preferiti")
+            star.setStyleSheet(f"color: {AMBER}; background: transparent; border: none; font-size: 12px;")
+            h.addWidget(star)
+
+        btn_del_site = QPushButton("✕")
+        btn_del_site.setFixedSize(24, 24)
+        btn_del_site.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_del_site.setToolTip("Cancella le visite a questo sito per questo giorno")
+        btn_del_site.setStyleSheet(f"""
+            QPushButton {{ background: transparent; color: {TEXT_DIM}; border: none; font-size: 12px; }}
+            QPushButton:hover {{ color: #FF6B6B; }}
+        """)
+        btn_del_site.clicked.connect(lambda _, d=date_key, dom=site["domain"]: self._delete_site(d, dom))
+        h.addWidget(btn_del_site)
+
+        row.mousePressEvent = lambda e, k=key: self._toggle_expand(k)
+        wv.addWidget(row)
+
+        if expanded:
+            sub = QWidget()
+            sub_v = QVBoxLayout(sub)
+            sub_v.setContentsMargins(38, 2, 4, 2)
+            sub_v.setSpacing(3)
+            for visit in site["visits"]:
+                sub_v.addWidget(self._make_visit_row(visit))
+            wv.addWidget(sub)
+
+        return wrap
+
+    def _make_visit_row(self, visit: Visit) -> QWidget:
+        row = QWidget()
+        row.setFixedHeight(28)
+        h = QHBoxLayout(row)
+        h.setContentsMargins(0, 0, 4, 0)
+        h.setSpacing(8)
+
+        time_lbl = QLabel(visit.dt.strftime("%H:%M"))
+        time_lbl.setFixedWidth(38)
+        time_lbl.setStyleSheet(f"color: {TEAL_DIM}; font-size: 10px; background: transparent; border: none;")
+        h.addWidget(time_lbl)
+
+        link = QPushButton(visit.title or visit.url)
+        link.setCursor(Qt.CursorShape.PointingHandCursor)
+        link.setToolTip(visit.url)
+        link.setStyleSheet(f"""
+            QPushButton {{ background: transparent; color: {TEXT_BRIGHT};
+                border: none; text-align: left; font-size: 11px; padding: 0; }}
+            QPushButton:hover {{ color: {TEAL}; text-decoration: underline; }}
+        """)
+        link.clicked.connect(lambda _, u=visit.url: self._open_url(u))
+        h.addWidget(link, stretch=1)
+
+        btn_del = QPushButton("✕")
+        btn_del.setFixedSize(20, 20)
+        btn_del.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_del.setStyleSheet(f"""
+            QPushButton {{ background: transparent; color: {TEXT_DIM}; border: none; font-size: 10px; }}
+            QPushButton:hover {{ color: #FF6B6B; }}
+        """)
+        btn_del.clicked.connect(lambda _, vid=visit.id: self._delete_visit(vid))
+        h.addWidget(btn_del)
+
+        return row
+
+    # ── Actions ──────────────────────────────────────────────────────────────
+    def _toggle_expand(self, key):
+        if key in self._expanded:
+            self._expanded.discard(key)
+        else:
+            self._expanded.add(key)
+        self._refresh()
+
+    def _open_url(self, url: str):
+        self.navigate.emit(url)
+        self.accept()
+
+    def _delete_visit(self, visit_id: str):
+        self._hist.delete_visit(visit_id)
+        self._refresh()
+
+    def _delete_site(self, date_key: str, domain: str):
+        self._hist.delete_site_on_day(domain, date_key)
+        self._refresh()
+
+    def _delete_day(self, date_key: str):
+        self._hist.delete_day(date_key)
+        self._refresh()
+
+    def _clear_all(self):
+        reply = QMessageBox.question(
+            self, "Cancella cronologia",
+            "Cancellare tutta la cronologia di navigazione?\nL'operazione non è reversibile.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            self._hist.clear_all()
+            self._expanded.clear()
+            self._refresh()
+
+
 def _show_pip(pip: "CalNavPiPWindow") -> None:
     """Show the PiP window (first time: bottom-right of screen) or raise it."""
     if not pip.isVisible():
@@ -3478,7 +3831,7 @@ class SettingsDialog(QDialog):
     right, the same layout every mainstream browser uses, so each setting
     lives somewhere predictable instead of one long scrolling list."""
 
-    _CATEGORIES = ["Generale", "Download", "Informazioni"]
+    _CATEGORIES = ["Generale", "Navigazione", "Download", "Informazioni"]
 
     def __init__(self, settings: dict, parent=None):
         super().__init__(parent)
@@ -3535,6 +3888,7 @@ class SettingsDialog(QDialog):
         # ── Pages ────────────────────────────────────────────────────────
         self._pages = QStackedWidget()
         self._pages.addWidget(self._build_general_page())
+        self._pages.addWidget(self._build_navigation_page())
         self._pages.addWidget(self._build_download_page())
         self._pages.addWidget(self._build_info_page())
         body.addWidget(self._pages, stretch=1)
@@ -3636,6 +3990,93 @@ class SettingsDialog(QDialog):
             url = parent.address_bar.text().strip()
             if url:
                 self._home_edit.setText(url)
+
+    # ── Navigazione (cronologia) ─────────────────────────────────────────
+
+    def _history_manager(self) -> Optional["HistoryManager"]:
+        return getattr(self.parent(), "history_manager", None)
+
+    def _bookmark_manager(self) -> Optional["BookmarkManager"]:
+        return getattr(self.parent(), "bookmark_manager", None)
+
+    def _build_navigation_page(self) -> QWidget:
+        page, vbox = self._page("Navigazione")
+
+        lbl = QLabel("Cronologia")
+        lbl.setStyleSheet(f"color: {TEXT_DIM}; font-size: 11px;")
+        vbox.addWidget(lbl)
+
+        hist = self._history_manager()
+        self._hist_count_lbl = QLabel(f"{hist.count() if hist else 0} pagine salvate in cronologia.")
+        self._hist_count_lbl.setStyleSheet("font-size: 12px;")
+        vbox.addWidget(self._hist_count_lbl)
+
+        btn_open = QPushButton("\U0001f4dc  Apri cronologia")
+        btn_open.setFixedHeight(34)
+        btn_open.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_open.setStyleSheet(self._secondary_btn_style())
+        btn_open.clicked.connect(self._open_history_from_settings)
+        vbox.addWidget(btn_open)
+
+        vbox.addSpacing(14)
+
+        lbl2 = QLabel("Cancella cronologia")
+        lbl2.setStyleSheet(f"color: {TEXT_DIM}; font-size: 11px;")
+        vbox.addWidget(lbl2)
+
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        for label, hours in (("Ultima ora", 1), ("Ultime 24 ore", 24),
+                             ("Ultimi 7 giorni", 24 * 7), ("Sempre", None)):
+            btn = QPushButton(label)
+            btn.setFixedHeight(30)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setStyleSheet(f"""
+                QPushButton {{ background: transparent; color: {TEXT_DIM};
+                    border: 1px solid #253852; border-radius: 8px; padding: 0 12px; font-size: 11px; }}
+                QPushButton:hover {{ border-color: #FF6B6B; color: #FF6B6B; }}
+            """)
+            btn.clicked.connect(lambda _, h=hours, lb=label: self._clear_history_range(h, lb))
+            row.addWidget(btn)
+        row.addStretch()
+        vbox.addLayout(row)
+
+        vbox.addStretch()
+        return page
+
+    def _navigate_and_close(self, url: str):
+        parent = self.parent()
+        if parent and hasattr(parent, "load"):
+            parent.load(url)
+        self.reject()
+
+    def _open_history_from_settings(self):
+        hist = self._history_manager()
+        if hist is None:
+            return
+        dlg = HistoryDialog(hist, self._bookmark_manager(), self)
+        dlg.navigate.connect(self._navigate_and_close)
+        dlg.exec()
+        self._refresh_history_count()
+
+    def _refresh_history_count(self):
+        hist = self._history_manager()
+        if hist is not None and hasattr(self, "_hist_count_lbl"):
+            self._hist_count_lbl.setText(f"{hist.count()} pagine salvate in cronologia.")
+
+    def _clear_history_range(self, hours: Optional[int], label: str):
+        hist = self._history_manager()
+        if hist is None:
+            return
+        reply = QMessageBox.question(
+            self, "Cancella cronologia",
+            f"Cancellare la cronologia — {label.lower()}?\nL'operazione non è reversibile.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        hist.delete_since(None if hours is None else datetime.now() - timedelta(hours=hours))
+        self._refresh_history_count()
 
     # ── Download ─────────────────────────────────────────────────────────
 
@@ -4635,6 +5076,7 @@ class CalNavWindow(QMainWindow):
         prof = self.profile_manager.current
         self.password_manager = PasswordManager(prof.passwords_file, prof.name)
         self.bookmark_manager = BookmarkManager(prof.bookmarks_file)
+        self.history_manager = HistoryManager(prof.history_file)
 
         # Shared bridge + channel (all tabs share the same bridge)
         self._bridge = CalNavBridge(self)
@@ -4823,6 +5265,7 @@ class CalNavWindow(QMainWindow):
 
         self.password_manager = PasswordManager(prof.passwords_file, prof.name)
         self.bookmark_manager = BookmarkManager(prof.bookmarks_file)
+        self.history_manager = HistoryManager(prof.history_file)
         self._save_bar.hide()
 
         old_profile = self._web_profile
@@ -4925,6 +5368,11 @@ class CalNavWindow(QMainWindow):
         dlg.exec()
         self._update_star_button(self.address_bar.text().strip())
 
+    def _open_history(self):
+        dlg = HistoryDialog(self.history_manager, self.bookmark_manager, self)
+        dlg.navigate.connect(self.load)
+        dlg.exec()
+
     def _update_star_button(self, url: str = ""):
         url = url or self.address_bar.text().strip()
         if self.bookmark_manager.is_bookmarked(url):
@@ -4953,15 +5401,16 @@ class CalNavWindow(QMainWindow):
             self.statusBar().showMessage("Impostazioni salvate.", 3000)
 
     def _on_save_request(self, url: str, username: str, password: str):
-        # Don't re-prompt if this exact credential is already stored (the page
-        # was just refreshed / re-submitted with the same login).
-        for e in self.password_manager.get(url):
-            if e["username"] == username and e["password"] == password:
-                return
         # Don't re-prompt for sites the user told us to stop asking about.
         if self.password_manager.is_host_ignored(url):
             return
-        self._save_bar.offer(url, username, password)
+        status = self.password_manager.match_status(url, username, password)
+        if status == "same":
+            return   # già salvata, identica: nessun prompt
+        # status == "new" (nessuna voce per questo host+utente) → offri di
+        # salvarla; status == "different" (stessa utenza, password cambiata)
+        # → offri di aggiornarla — stesso bar, testo/pulsante diversi.
+        self._save_bar.offer(url, username, password, is_update=(status == "different"))
 
     def _on_save_bar_saved(self, url: str, username: str, password: str):
         self.password_manager.save(url, username, password)
@@ -4978,9 +5427,11 @@ class CalNavWindow(QMainWindow):
         view = self.webview
         if not view:
             return
-        # Escape strings for safe JS interpolation
-        u = username.replace("\\", "\\\\").replace("'", "\\'")
-        p = password.replace("\\", "\\\\").replace("'", "\\'")
+        # json.dumps produces a valid, fully-escaped JS string literal
+        # regardless of what characters the credential contains (quotes,
+        # backslashes, newlines, …) — safer than manual escaping.
+        u = json.dumps(username)
+        p = json.dumps(password)
         view.page().runJavaScript(f"""
 (function(usr, pwd) {{
     function setNative(el, val) {{
@@ -5012,7 +5463,7 @@ class CalNavWindow(QMainWindow):
         if (usrEl) setNative(usrEl, usr);
         setNative(pw, pwd);
     }});
-}})('{u}', '{p}');
+}})({u}, {p});
         """)
 
     # ── Shortcuts ─────────────────────────────────────────────────────────────
@@ -5029,6 +5480,7 @@ class CalNavWindow(QMainWindow):
         QShortcut(QKeySequence("Print"),          self, lambda: self.webview.take_screenshot() if self.webview else None)
         QShortcut(QKeySequence("Ctrl+D"),         self, self._toggle_bookmark)
         QShortcut(QKeySequence("Ctrl+Shift+B"),   self, self._open_bookmarks)
+        QShortcut(QKeySequence("Ctrl+Shift+H"),   self, self._open_history)
         QShortcut(QKeySequence("Ctrl+Shift+P"),   self, self._open_profile_dialog)
         QShortcut(QKeySequence("Ctrl+Shift+K"),   self, self._open_password_vault)
         QShortcut(QKeySequence("Ctrl+P"),         self, self._open_print_preview)
@@ -5045,6 +5497,84 @@ class CalNavWindow(QMainWindow):
     def _focus_address_bar(self):
         self.address_bar.setFocus()
         self.address_bar.selectAll()
+
+    # ── Address-bar suggestions (preferiti + cronologia) ─────────────────────
+    _ADDR_URL_ROLE = Qt.ItemDataRole.UserRole
+
+    def _setup_address_completer(self):
+        """Attach a completer to the (possibly just-rebuilt) address bar.
+
+        The completer instance itself is created once and reused across
+        theme rebuilds — only the QLineEdit it's bound to changes."""
+        if not hasattr(self, "_addr_completer"):
+            self._addr_suggest_model = QStandardItemModel(self)
+            self._addr_completer = QCompleter(self)
+            self._addr_completer.setModel(self._addr_suggest_model)
+            self._addr_completer.setCompletionMode(
+                QCompleter.CompletionMode.UnfilteredPopupCompletion
+            )
+            self._addr_completer.setMaxVisibleItems(8)
+            self._addr_completer.activated[QModelIndex].connect(self._on_suggestion_activated)
+        self._style_addr_completer()
+        self.address_bar.setCompleter(self._addr_completer)
+        self.address_bar.textEdited.connect(self._on_address_text_edited)
+
+    def _style_addr_completer(self):
+        popup = self._addr_completer.popup()
+        popup.setStyleSheet(f"""
+            QListView {{
+                background: {NAVY_MID}; color: {TEXT_BRIGHT};
+                border: 1px solid {TEAL_DIM}; border-radius: 8px;
+                padding: 4px; outline: none;
+            }}
+            QListView::item {{ padding: 6px 10px; border-radius: 5px; }}
+            QListView::item:selected {{ background: rgba(0,212,255,0.18); color: {TEAL}; }}
+        """)
+
+    def _build_address_suggestions(self, text: str, limit: int = 8):
+        """Suggerimenti per la barra indirizzi: precedenza ai preferiti,
+        poi la cronologia — deduplicati per url. Ritorna (title, url, is_bookmark)."""
+        q = text.strip().lower()
+        if not q or not hasattr(self, "bookmark_manager"):
+            return []
+        results = []
+        seen = set()
+        for bm in self.bookmark_manager.get_all():
+            if bm.url in seen or (q not in bm.url.lower() and q not in bm.title.lower()):
+                continue
+            results.append((bm.title, bm.url, True))
+            seen.add(bm.url)
+            if len(results) >= limit:
+                return results
+        if hasattr(self, "history_manager"):
+            for v in self.history_manager.suggestions(q, limit=limit * 2):
+                if v.url in seen:
+                    continue
+                results.append((v.title, v.url, False))
+                seen.add(v.url)
+                if len(results) >= limit:
+                    break
+        return results
+
+    def _on_address_text_edited(self, text: str):
+        matches = self._build_address_suggestions(text)
+        model = self._addr_suggest_model
+        model.removeRows(0, model.rowCount())
+        for title, url, is_bm in matches:
+            label = f"{'★' if is_bm else '🕘'}  {title}   —   {url}"
+            item = QStandardItem(label)
+            item.setData(url, self._ADDR_URL_ROLE)
+            model.appendRow(item)
+        if matches:
+            self._addr_completer.complete()
+        else:
+            self._addr_completer.popup().hide()
+
+    def _on_suggestion_activated(self, index: QModelIndex):
+        url = index.data(self._ADDR_URL_ROLE)
+        if url:
+            self.address_bar.setText(url)
+            self.load(url)
 
     def _open_devtools(self):
         if self.webview:
@@ -6021,6 +6551,7 @@ class CalNavWindow(QMainWindow):
 
         self.address_bar = AddressBar()
         self.address_bar.returnPressed.connect(self._navigate_from_bar)
+        self._setup_address_completer()
         h.addWidget(self.address_bar, stretch=1)
 
         btn_go = QPushButton("Vai")
@@ -6431,6 +6962,20 @@ class CalNavWindow(QMainWindow):
         if idx >= 0:
             self._tab_widget.setTabText(idx, (title[:28] + "…") if len(title) > 28 else title or "Nuova scheda")
             self._tab_widget.setTabToolTip(idx, title)
+
+        # ── Record to history — one entry per navigated url; subsequent
+        # titleChanged for the SAME url (SPA <title> updates) just refresh
+        # that entry's title instead of appending a new row.
+        if title and view is not None and hasattr(self, "history_manager"):
+            u = view.url()
+            if u.scheme() in ("http", "https"):
+                full_url = u.toString()
+                if getattr(view, "_calnav_hist_url", None) == full_url:
+                    self.history_manager.update_last_title(full_url, title)
+                else:
+                    self.history_manager.add_visit(full_url, title)
+                    view._calnav_hist_url = full_url
+
         # Update window title only for current tab
         if view is self.webview:
             prof = self.profile_manager.current

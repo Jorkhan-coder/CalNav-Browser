@@ -42,6 +42,10 @@ class Profile:
         return self.path / "bookmarks.json"
 
     @property
+    def history_file(self) -> Path:
+        return self.path / "history.json"
+
+    @property
     def session_file(self) -> Path:
         return self.path / "session.json"
 
