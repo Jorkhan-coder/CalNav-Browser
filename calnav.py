@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """CalNav Browser — Modern spirit, classic roots."""
 
-__version__ = "1.1.42-alpha"
+__version__ = "1.1.43-alpha"
 
 # Bumped ONLY when the frozen build's runtime dependencies change (PyQt6 /
 # PyQt6-WebEngine version, or the vendor/ payloads — WebView2Loader.dll,
@@ -6946,12 +6946,25 @@ class CalNavWindow(QMainWindow):
         self.btn_reload.clicked.disconnect()
         self.btn_reload.clicked.connect(self._toggle_reload)
         self.statusBar().showMessage("Pronto" if ok else "Errore nel caricamento", 5000)
-        # \u2500\u2500 Autofill: offer credentials if we have any for this host \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+        # \u2500\u2500 Autofill: offer credentials only on a page that actually HAS a
+        # login form \u2014 otherwise every saved-credential site nags on every
+        # single page (dashboard, map, whatever), long after the user is
+        # already logged in. `get(url)` only matches by host, so it can't
+        # tell a login page from any other page on the same site; a quick
+        # DOM check for a password field can.
         if ok and self.password_manager.available:
             url = view.url().toString()
             creds = self.password_manager.get(url)
             if creds:
-                self._autofill_bar.offer(creds)
+                def _on_pw_field_check(has_pw_field, v=view, u=url, c=creds):
+                    if v is self.webview and v.url().toString() == u and has_pw_field:
+                        self._autofill_bar.offer(c)
+                    else:
+                        self._autofill_bar.hide()
+                view.page().runJavaScript(
+                    '!!document.querySelector(\'input[type="password"]\')',
+                    _on_pw_field_check,
+                )
             else:
                 self._autofill_bar.hide()
 
