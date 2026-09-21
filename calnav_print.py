@@ -249,6 +249,8 @@ class PrintPreviewDialog(QDialog):
         self._pdf_bytes: Optional[bytes] = None
         self._extra_pdf_bytes: List[bytes] = []   # from merged tabs
         self._tmp_path = None
+        self._gen_seq = 0   # guards against a stale/overlapping capture_page_pdf callback
+        self._gen_complete = False
 
         self.setWindowTitle(f"Stampa — {view.title() or view.url().toString()}")
         self.resize(920, 720)
@@ -294,9 +296,16 @@ class PrintPreviewDialog(QDialog):
         opts.addWidget(self._format)
         vbox.addLayout(opts)
 
+        status_row = QHBoxLayout()
         self._status = QLabel("")
         self._status.setStyleSheet("color: #888; font-size: 11px;")
-        vbox.addWidget(self._status)
+        status_row.addWidget(self._status, stretch=1)
+
+        self._btn_retry = QPushButton("Riprova")
+        self._btn_retry.clicked.connect(self._regenerate)
+        self._btn_retry.setVisible(False)
+        status_row.addWidget(self._btn_retry)
+        vbox.addLayout(status_row)
 
         btns = QHBoxLayout()
         btn_merge = QPushButton("Unisci altre schede…")
@@ -321,17 +330,38 @@ class PrintPreviewDialog(QDialog):
     # ── Generation ────────────────────────────────────────────────────────
 
     def _regenerate(self):
+        self._btn_retry.setVisible(False)
         self._status.setText("⏳  Generazione anteprima…")
+        self._gen_seq += 1
+        self._gen_complete = False
+        seq = self._gen_seq
         capture_page_pdf(
             self._view,
             reader_mode=self._chk_reader.isChecked(),
             stamp=self._chk_stamp.isChecked(),
-            on_done=self._on_captured,
+            on_done=lambda data, error: self._on_captured(seq, data, error),
         )
+        # Chromium's printToPdf is async and, in rare cases, its completion
+        # callback never arrives (observed hang with no error, no exception —
+        # just silence). Surface that after a while instead of leaving
+        # "Generazione anteprima…" up forever with a "Riprova" escape hatch,
+        # rather than pretending we can wait it out.
+        QTimer.singleShot(12_000, lambda: self._on_generation_timeout(seq))
 
-    def _on_captured(self, pdf_bytes: Optional[bytes], error: str):
+    def _on_generation_timeout(self, seq: int):
+        if seq != self._gen_seq or self._gen_complete:
+            return   # already completed (or superseded) — ignore
+        self._status.setText(
+            "⚠  La generazione sta impiegando troppo tempo (possibile blocco di Chromium).")
+        self._btn_retry.setVisible(True)
+
+    def _on_captured(self, seq: int, pdf_bytes: Optional[bytes], error: str):
+        if seq != self._gen_seq:
+            return   # stale callback from a superseded generation — ignore
+        self._gen_complete = True
         if pdf_bytes is None:
             self._status.setText(f"❌  {error}")
+            self._btn_retry.setVisible(True)
             return
         chunks = [pdf_bytes] + self._extra_pdf_bytes
         try:

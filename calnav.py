@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """CalNav Browser — Modern spirit, classic roots."""
 
-__version__ = "1.1.43-alpha"
+__version__ = "1.1.44-alpha"
 
 # Bumped ONLY when the frozen build's runtime dependencies change (PyQt6 /
 # PyQt6-WebEngine version, or the vendor/ payloads — WebView2Loader.dll,
@@ -434,6 +434,126 @@ DETECT_FORMS_JS = """
 })();
 """
 
+# ── Autofill suggestion dropdown (injected at DocumentReady in every page) ───
+# Renders a small dropdown right under a focused username/password field,
+# like Chrome's own autofill suggestion — instead of a top-of-window bar
+# that reads as a request to ADD a password rather than an offer to use one
+# already saved. Python pushes the candidate usernames for the current page
+# into window.__calnavAutofillUsers (see CalNavWindow._push_autofill_candidates);
+# this script only reacts to focus and never sees the actual passwords —
+# picking a row calls back into Python (which does hold them) to fill the form.
+AUTOFILL_SUGGEST_JS = r"""
+(function() {
+    if (window.__cn_autofill_init) return;
+    window.__cn_autofill_init = true;
+
+    var attempts = 0;
+    var channelReady = false;
+    var bridge = null;
+    function tryInit() {
+        if (typeof QWebChannel === 'undefined' || typeof qt === 'undefined'
+            || !qt.webChannelTransport) {
+            if (++attempts < 40) { setTimeout(tryInit, 50); }
+            return;
+        }
+        new QWebChannel(qt.webChannelTransport, onChannel);
+        setTimeout(function() {
+            if (!channelReady && ++attempts < 40) { tryInit(); }
+        }, 250);
+    }
+    function onChannel(channel) {
+        if (channelReady) return;
+        var b = channel.objects.calnav_bridge;
+        if (!b) return;
+        channelReady = true;
+        bridge = b;
+    }
+    tryInit();
+
+    var FIELD_SELECTOR = [
+        'input[type="password"]',
+        'input[type="email"]', 'input[autocomplete="username"]',
+        'input[autocomplete="email"]', 'input[name*="email" i]',
+        'input[name*="user" i]', 'input[name*="login" i]',
+        'input[id*="email" i]', 'input[id*="user" i]', 'input[id*="login" i]',
+        'input[type="text"]'
+    ].join(',');
+
+    var dd = null;
+    var activeField = null;
+
+    function hideDropdown() {
+        if (dd) { dd.remove(); dd = null; }
+        activeField = null;
+    }
+
+    function positionDropdown() {
+        if (!dd || !activeField) return;
+        var r = activeField.getBoundingClientRect();
+        dd.style.left = Math.round(r.left) + 'px';
+        dd.style.top = Math.round(r.bottom + 4) + 'px';
+        dd.style.minWidth = Math.round(r.width) + 'px';
+    }
+
+    function showDropdown(field, users) {
+        hideDropdown();
+        activeField = field;
+        dd = document.createElement('div');
+        dd.style.cssText =
+            'position: fixed; z-index: 2147483647; background: #0D1F3C; ' +
+            'border: 1px solid #008EAA; border-radius: 8px; padding: 4px; ' +
+            'box-shadow: 0 6px 18px rgba(0,0,0,0.4); ' +
+            'font: 13px/1.3 "Segoe UI", Arial, sans-serif; ' +
+            '-webkit-user-select: none; user-select: none;';
+        users.forEach(function(u, i) {
+            var row = document.createElement('div');
+            row.textContent = '🔑  ' + u;
+            row.style.cssText =
+                'padding: 7px 10px; border-radius: 5px; color: #E8F4FD; ' +
+                'cursor: pointer; white-space: nowrap;';
+            row.addEventListener('mouseenter', function() {
+                row.style.background = 'rgba(0,212,255,0.14)';
+            });
+            row.addEventListener('mouseleave', function() {
+                row.style.background = 'transparent';
+            });
+            // mousedown (not click) + preventDefault so the field never
+            // loses focus — avoids racing our own focusout-hide handler.
+            row.addEventListener('mousedown', function(ev) {
+                ev.preventDefault();
+                if (bridge) {
+                    try { bridge.autofill_pick(location.href, i); } catch (e) {}
+                }
+                hideDropdown();
+            });
+            dd.appendChild(row);
+        });
+        document.body.appendChild(dd);
+        positionDropdown();
+    }
+
+    document.addEventListener('focusin', function(ev) {
+        var el = ev.target;
+        if (!el.matches || !el.matches(FIELD_SELECTOR)) { hideDropdown(); return; }
+        var users = window.__calnavAutofillUsers;
+        if (!users || !users.length) return;
+        showDropdown(el, users);
+    });
+
+    document.addEventListener('focusout', function() {
+        setTimeout(function() {
+            if (dd && document.activeElement !== activeField) hideDropdown();
+        }, 120);
+    });
+
+    window.addEventListener('scroll', hideDropdown, true);
+    window.addEventListener('resize', hideDropdown);
+    document.addEventListener('keydown', function(ev) {
+        if (ev.key === 'Escape') hideDropdown();
+    });
+})();
+"""
+
 # ── Media detection & control JS (injected at DocumentReady in every page) ───
 MEDIA_JS = r"""
 (function() {
@@ -775,6 +895,10 @@ class CalNavBridge(QObject):
     # Emitted every time the active tab's media state changes.
     # Payload is a JSON string (see MEDIA_JS for schema).
     media_state_changed = pyqtSignal(str)
+    # Emitted when the user picks a row from the in-page autofill dropdown
+    # (see AUTOFILL_SUGGEST_JS). index is into the candidate list Python
+    # pushed for that page — the page itself never sees the passwords.
+    autofill_pick_requested = pyqtSignal(str, int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -787,6 +911,10 @@ class CalNavBridge(QObject):
     def on_media_state(self, state_json: str):
         """Receives media state from MEDIA_JS running in any tab."""
         self.media_state_changed.emit(state_json)
+
+    @pyqtSlot(str, int)
+    def autofill_pick(self, url: str, index: int):
+        self.autofill_pick_requested.emit(url, index)
 
 
 # ── Save-password notification bar ───────────────────────────────────────────
@@ -1796,144 +1924,6 @@ class PasswordVaultDialog(QDialog):
 
     def _open_generator(self):
         PasswordGeneratorDialog(self).exec()
-
-
-# ── Autofill bar ──────────────────────────────────────────────────────────────
-class AutofillBar(QWidget):
-    """Thin bar shown when saved credentials are available for the current page."""
-
-    fill_requested = pyqtSignal(str, str)  # username, password
-    dismissed      = pyqtSignal()
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setObjectName("autofill_bar")
-        self.setFixedHeight(38)
-        self.setStyleSheet(self._bar_ss())
-        self.hide()
-
-        row = QHBoxLayout(self)
-        row.setContentsMargins(14, 0, 8, 0)
-        row.setSpacing(8)
-
-        icon = QLabel("\U0001f511")
-        icon.setFixedWidth(20)
-        row.addWidget(icon)
-
-        self._msg = QLabel("")
-        row.addWidget(self._msg)
-        row.addStretch()
-
-        self._combo = QComboBox()
-        self._combo.setFixedHeight(26)
-        self._combo.setStyleSheet(f"""
-            QComboBox {{
-                background: {NAVY_DEEP}; color: {TEXT_BRIGHT};
-                border: 1px solid #1C3050; border-radius: 4px;
-                padding: 0 6px; font-size: 12px;
-            }}
-            QComboBox::drop-down {{ border: none; }}
-            QComboBox QAbstractItemView {{
-                background: {NAVY_MID}; color: {TEXT_BRIGHT};
-                selection-background-color: rgba(0,212,255,0.2);
-            }}
-        """)
-        self._combo.hide()
-        row.addWidget(self._combo)
-
-        self._btn_fill = QPushButton("Compila")
-        self._btn_fill.setFixedHeight(26)
-        self._btn_fill.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._btn_fill.setStyleSheet(self._fill_btn_ss())
-        self._btn_fill.clicked.connect(self._on_fill)
-        row.addWidget(self._btn_fill)
-
-        self._btn_dismiss = QPushButton("Ignora")
-        self._btn_dismiss.setFixedHeight(26)
-        self._btn_dismiss.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._btn_dismiss.setStyleSheet(self._dismiss_btn_ss())
-        self._btn_dismiss.clicked.connect(self._dismiss)
-        row.addWidget(self._btn_dismiss)
-
-        self._entries: list = []
-
-    def _bar_ss(self) -> str:
-        return f"""
-            QWidget#autofill_bar {{
-                background: {NAVY_MID}; border-bottom: 1px solid {TEAL_DIM};
-            }}
-            QLabel {{ color: {TEXT_BRIGHT}; font-size: 12px; background: transparent; }}
-        """
-
-    def _fill_btn_ss(self) -> str:
-        return f"""
-            QPushButton {{ background: {TEAL}; color: {NAVY_DEEP};
-                border: none; border-radius: 5px; padding: 2px 12px;
-                font-weight: bold; font-size: 12px; }}
-            QPushButton:hover {{ background: {TEAL}; opacity: 0.85; }}
-        """
-
-    def _dismiss_btn_ss(self) -> str:
-        return f"""
-            QPushButton {{ background: {BTN_HOVER}; color: {TEAL};
-                border: none; border-radius: 5px; padding: 2px 10px; font-size: 12px; }}
-            QPushButton:hover {{ background: {BTN_PRESS}; }}
-        """
-
-    def retheme(self):
-        self.setStyleSheet(self._bar_ss())
-        if hasattr(self, "_msg"):
-            self._msg.setStyleSheet(f"color: {TEXT_BRIGHT}; font-size: 12px; background: transparent;")
-        if hasattr(self, "_combo"):
-            self._combo.setStyleSheet(f"""
-                QComboBox {{
-                    background: {NAVY_LIGHT}; color: {TEXT_BRIGHT};
-                    border: 1px solid {TEAL_DIM}; border-radius: 4px;
-                    padding: 0 6px; font-size: 12px;
-                }}
-                QComboBox::drop-down {{ border: none; }}
-                QComboBox QAbstractItemView {{
-                    background: {NAVY_MID}; color: {TEXT_BRIGHT};
-                    selection-background-color: {BTN_HOVER};
-                }}
-            """)
-        if hasattr(self, "_btn_fill"):
-            self._btn_fill.setStyleSheet(self._fill_btn_ss())
-            self._btn_dismiss.setStyleSheet(self._dismiss_btn_ss())
-
-    def offer(self, entries: list):
-        """Show the bar for a list of credential dicts (host already matched)."""
-        if not entries:
-            self.hide()
-            return
-        self._entries = entries
-        if len(entries) == 1:
-            e = entries[0]
-            self._msg.setText(
-                f"Credenziali salvate per  <b>{e['host']}</b>  ({e['username']})")
-            self._combo.hide()
-        else:
-            self._msg.setText(
-                f"Credenziali salvate per  <b>{entries[0]['host']}</b>:")
-            self._combo.clear()
-            for e in entries:
-                self._combo.addItem(e["username"])
-            self._combo.show()
-        self.show()
-
-    def _on_fill(self):
-        if not self._entries:
-            return
-        idx = max(self._combo.currentIndex(), 0) if self._combo.isVisible() else 0
-        e = self._entries[idx]
-        self.fill_requested.emit(e["username"], e["password"])
-        self.hide()
-        self.dismissed.emit()
-
-    def _dismiss(self):
-        self.hide()
-        self.dismissed.emit()
-
 
 
 # ── Bookmark helpers ─────────────────────────────────────────────────────────
@@ -4989,7 +4979,18 @@ class BrowserView(QWebEngineView):
         menu.addAction(page.action(WA.SelectAll))
         menu.addSeparator()
         act_print = menu.addAction("🖨  Stampa pagina  Ctrl+P")
-        act_print.triggered.connect(self.printRequested.emit)
+        # Deferred: contextMenuEvent (and the QMenu.exec() inside it) runs
+        # nested inside QtWebEngine's own context-menu IPC round-trip with
+        # Chromium. Calling page.printToPdf() — another async Chromium IPC
+        # request — synchronously from inside that same call stack deadlocks
+        # it (the print preview hangs forever on "Generazione anteprima…",
+        # reproducible every time). Triggering the SAME action from the
+        # toolbar "..." menu — an ordinary QPushButton click, not nested in
+        # contextMenuEvent — works fine, which is what exposed this.
+        # QTimer.singleShot(0, …) defers the emit to the next event-loop
+        # iteration, after contextMenuEvent has fully returned and the
+        # Chromium context-menu round-trip has unwound.
+        act_print.triggered.connect(lambda: QTimer.singleShot(0, self.printRequested.emit))
         # QtWebEngine's own WebActions carry hardcoded English text (Chromium
         # strings, not Qt's own translated ones) — set our Italian labels on
         # them explicitly rather than mixing languages in the same menu.
@@ -5000,7 +5001,10 @@ class BrowserView(QWebEngineView):
         act_screenshot.triggered.connect(self.take_screenshot)
         menu.addSeparator()
         act_source = menu.addAction("👁  Visualizza sorgente  Ctrl+U")
-        act_source.triggered.connect(self.open_source_viewer)
+        # Same deferred-call fix as "Stampa pagina" above: SourceViewerDialog
+        # also kicks off an async page.toHtml() call as soon as it's built,
+        # which would otherwise run nested inside contextMenuEvent too.
+        act_source.triggered.connect(lambda: QTimer.singleShot(0, self.open_source_viewer))
         act_inspect = page.action(WA.InspectElement)
         act_inspect.setText("🔧  Ispeziona elemento")
         menu.addAction(act_inspect)
@@ -5082,6 +5086,8 @@ class CalNavWindow(QMainWindow):
         self._bridge = CalNavBridge(self)
         self._bridge.save_password_requested.connect(self._on_save_request)
         self._bridge.media_state_changed.connect(self._on_media_state)
+        self._bridge.autofill_pick_requested.connect(self._on_autofill_pick)
+        self._autofill_candidates: list = []
         self._channel = QWebChannel(self)
         self._channel.registerObject("calnav_bridge", self._bridge)
 
@@ -5158,7 +5164,7 @@ class CalNavWindow(QMainWindow):
 
         scripts = p.scripts()
         for name in ("calnav_ie_shims", "calnav_qwebchannel", "calnav_forms",
-                     "calnav_media", "calnav_chrome_compat"):
+                     "calnav_media", "calnav_chrome_compat", "calnav_autofill"):
             for old in scripts.find(name):
                 scripts.remove(old)
 
@@ -5187,6 +5193,13 @@ class CalNavWindow(QMainWindow):
         form_script.setInjectionPoint(QWebEngineScript.InjectionPoint.DocumentReady)
         form_script.setWorldId(QWebEngineScript.ScriptWorldId.MainWorld)
         scripts.insert(form_script)
+
+        autofill_script = QWebEngineScript()
+        autofill_script.setName("calnav_autofill")
+        autofill_script.setSourceCode(AUTOFILL_SUGGEST_JS)
+        autofill_script.setInjectionPoint(QWebEngineScript.InjectionPoint.DocumentReady)
+        autofill_script.setWorldId(QWebEngineScript.ScriptWorldId.MainWorld)
+        scripts.insert(autofill_script)
 
         # ── Media detection & control script ─────────────────────────────────
         media_script = QWebEngineScript()
@@ -5466,6 +5479,26 @@ class CalNavWindow(QMainWindow):
 }})({u}, {p});
         """)
 
+    def _push_autofill_candidates(self, view: QWebEngineView, creds: list):
+        """Tell AUTOFILL_SUGGEST_JS which usernames to offer for this page.
+
+        Only usernames cross into the page's JS — the passwords stay in
+        Python (self._autofill_candidates) and are only ever sent back via
+        _on_autofill_fill, once the user has actually picked a row."""
+        self._autofill_candidates = creds
+        usernames = json.dumps([e["username"] for e in creds])
+        view.page().runJavaScript(f"window.__calnavAutofillUsers = {usernames};")
+
+    def _on_autofill_pick(self, url: str, index: int):
+        """The user clicked a row in the in-page autofill dropdown."""
+        view = self.webview
+        if not view or view.url().toString() != url:
+            return
+        if index < 0 or index >= len(self._autofill_candidates):
+            return
+        e = self._autofill_candidates[index]
+        self._on_autofill_fill(e["username"], e["password"])
+
     # ── Shortcuts ─────────────────────────────────────────────────────────────
     def _setup_shortcuts(self):
         QShortcut(QKeySequence("Ctrl+L"),         self, self._focus_address_bar)
@@ -5741,7 +5774,6 @@ class CalNavWindow(QMainWindow):
 
         # Re-style persistent bars
         self._save_bar.retheme()
-        self._autofill_bar.retheme()
         self._media_bar.retheme()
         self._update_bar.retheme()
 
@@ -6475,10 +6507,6 @@ class CalNavWindow(QMainWindow):
         self._save_bar.dismissed.connect(self._on_save_bar_dismissed)
         vbox.addWidget(self._save_bar)
 
-        self._autofill_bar = AutofillBar()
-        self._autofill_bar.fill_requested.connect(self._on_autofill_fill)
-        vbox.addWidget(self._autofill_bar)
-
         self._codec_bar = CodecEngineBar()
         self._codec_bar.open_edge_requested.connect(
             lambda: self._open_webview2_engine_window())
@@ -6958,15 +6986,15 @@ class CalNavWindow(QMainWindow):
             if creds:
                 def _on_pw_field_check(has_pw_field, v=view, u=url, c=creds):
                     if v is self.webview and v.url().toString() == u and has_pw_field:
-                        self._autofill_bar.offer(c)
+                        self._push_autofill_candidates(v, c)
                     else:
-                        self._autofill_bar.hide()
+                        self._autofill_candidates = []
                 view.page().runJavaScript(
                     '!!document.querySelector(\'input[type="password"]\')',
                     _on_pw_field_check,
                 )
             else:
-                self._autofill_bar.hide()
+                self._autofill_candidates = []
 
     def _on_title_changed(self, title: str):
         view = self.sender()
