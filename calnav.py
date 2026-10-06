@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """CalNav Browser — Modern spirit, classic roots."""
 
-__version__ = "1.1.47-alpha"
+__version__ = "1.1.48-alpha"
 
 # Bumped ONLY when the frozen build's runtime dependencies change (PyQt6 /
 # PyQt6-WebEngine version, or the vendor/ payloads — WebView2Loader.dll,
@@ -4961,6 +4961,20 @@ class BrowserView(QWebEngineView):
 
     printRequested = pyqtSignal()
 
+    # Set by CalNavWindow._new_tab: callable(activate: bool) -> BrowserView.
+    popup_factory = None
+
+    def createWindow(self, wtype):
+        """Links with target=_blank and window.open() (e.g. Gmail's "Sign in")
+        land here. Without an override QtWebEngine has no window to give the
+        page, so the click is silently dropped. Open a new tab and hand its
+        view back — Chromium then navigates it and keeps the opener link,
+        which popup-based logins (OAuth) rely on."""
+        if self.popup_factory is None:
+            return None
+        background = wtype == QWebEnginePage.WebWindowType.WebBrowserBackgroundTab
+        return self.popup_factory(not background)
+
     def _build_context_menu(self) -> "QMenu | None":
         page = self.page()
         if page is None:
@@ -5862,6 +5876,7 @@ class CalNavWindow(QMainWindow):
         page.setWebChannel(self._channel)
         view.setPage(page)
         view.printRequested.connect(lambda v=view: self._open_print_preview(v))
+        view.popup_factory = lambda activate: self._new_tab(activate=activate)
 
         # Connect signals
         view.urlChanged.connect(self._on_url_changed)
