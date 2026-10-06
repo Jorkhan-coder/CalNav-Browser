@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """CalNav Browser — Modern spirit, classic roots."""
 
-__version__ = "1.1.44-alpha"
+__version__ = "1.1.45-alpha"
 
 # Bumped ONLY when the frozen build's runtime dependencies change (PyQt6 /
 # PyQt6-WebEngine version, or the vendor/ payloads — WebView2Loader.dll,
@@ -91,6 +91,7 @@ import calnav_webplugins
 
 from calnav_profiles import ProfileManager, PROFILE_COLORS, DATA_DIR
 from calnav_passwords import PasswordManager
+import calnav_mailguard
 from calnav_bookmarks import BookmarkManager, Bookmark, UNCATEGORIZED
 from calnav_history import HistoryManager, Visit
 from calnav_session import TabGroup, SavedTab, SessionManager
@@ -5304,6 +5305,25 @@ class CalNavWindow(QMainWindow):
         dlg = PasswordVaultDialog(self.password_manager, self)
         dlg.exec()
 
+    def _check_mail_reliability(self):
+        """Extract the open webmail message from the page and show a local
+        phishing-risk estimate (see calnav_mailguard)."""
+        view = self.webview
+        if view is None:
+            calnav_mailguard.show_report(self, None)
+            return
+
+        def done(result):
+            data = None
+            try:
+                data = json.loads(result) if result else None
+            except Exception:
+                pass
+            # Deferred: don't open a modal dialog from inside the JS callback.
+            QTimer.singleShot(0, lambda: calnav_mailguard.show_report(self, data))
+
+        view.page().runJavaScript(calnav_mailguard.EXTRACT_JS, done)
+
     def _open_print_preview(self, view: Optional[QWebEngineView] = None):
         view = view or self.webview
         if view is None:
@@ -5516,6 +5536,7 @@ class CalNavWindow(QMainWindow):
         QShortcut(QKeySequence("Ctrl+Shift+H"),   self, self._open_history)
         QShortcut(QKeySequence("Ctrl+Shift+P"),   self, self._open_profile_dialog)
         QShortcut(QKeySequence("Ctrl+Shift+K"),   self, self._open_password_vault)
+        QShortcut(QKeySequence("Ctrl+Shift+M"),   self, self._check_mail_reliability)
         QShortcut(QKeySequence("Ctrl+P"),         self, self._open_print_preview)
         QShortcut(QKeySequence("Ctrl+,"),         self, self._open_settings)
         # Tab management
