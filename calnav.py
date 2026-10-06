@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """CalNav Browser — Modern spirit, classic roots."""
 
-__version__ = "1.1.45-alpha"
+__version__ = "1.1.46-alpha"
 
 # Bumped ONLY when the frozen build's runtime dependencies change (PyQt6 /
 # PyQt6-WebEngine version, or the vendor/ payloads — WebView2Loader.dll,
@@ -5306,23 +5306,9 @@ class CalNavWindow(QMainWindow):
         dlg.exec()
 
     def _check_mail_reliability(self):
-        """Extract the open webmail message from the page and show a local
-        phishing-risk estimate (see calnav_mailguard)."""
-        view = self.webview
-        if view is None:
-            calnav_mailguard.show_report(self, None)
-            return
-
-        def done(result):
-            data = None
-            try:
-                data = json.loads(result) if result else None
-            except Exception:
-                pass
-            # Deferred: don't open a modal dialog from inside the JS callback.
-            QTimer.singleShot(0, lambda: calnav_mailguard.show_report(self, data))
-
-        view.page().runJavaScript(calnav_mailguard.EXTRACT_JS, done)
+        """Phishing-risk estimate of the open webmail message (see
+        calnav_mailguard: DOM extraction, Gmail auth headers, local rules)."""
+        calnav_mailguard.run(self, self.webview)
 
     def _open_print_preview(self, view: Optional[QWebEngineView] = None):
         view = view or self.webview
