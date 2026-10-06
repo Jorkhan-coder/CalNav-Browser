@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """CalNav Browser — Modern spirit, classic roots."""
 
-__version__ = "1.1.46-alpha"
+__version__ = "1.1.47-alpha"
 
 # Bumped ONLY when the frozen build's runtime dependencies change (PyQt6 /
 # PyQt6-WebEngine version, or the vendor/ payloads — WebView2Loader.dll,
@@ -887,7 +887,11 @@ class AddressBar(QLineEdit):
 
     def focusInEvent(self, e):
         super().focusInEvent(e)
-        self.selectAll()
+        # Not when focus comes back from the suggestions popup: the popup
+        # opens while the user is typing, and selecting everything here made
+        # the next keystroke overwrite what had just been typed.
+        if e.reason() != Qt.FocusReason.PopupFocusReason:
+            self.selectAll()
 
 
 # ── QWebChannel bridge ────────────────────────────────────────────────────────

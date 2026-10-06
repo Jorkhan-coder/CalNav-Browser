@@ -11,6 +11,7 @@ import sys
 import subprocess
 import shutil
 import zipfile
+import re
 import textwrap
 from pathlib import Path
 
@@ -21,7 +22,12 @@ if hasattr(sys.stdout, "reconfigure"):
 # -- Configurazione ------------------------------------------------------------
 ROOT        = Path(__file__).parent.resolve()
 APP_NAME    = "CalNav"
-APP_VERSION = "1.1.43-alpha"
+# Single source of truth: __version__ in calnav.py (this constant used to be
+# bumped by hand and went stale, so release assets kept the old version name).
+APP_VERSION = re.search(
+    r'^__version__\s*=\s*"([^"]+)"',
+    (ROOT / "calnav.py").read_text(encoding="utf-8"), re.M,
+).group(1)
 # Keep in sync with RUNTIME_VERSION in calnav.py — bump ONLY when PyQt6/Qt or
 # the vendor/ payloads change. Lets the auto-updater ship a ~2 MB CalNav.exe
 # swap instead of a full reinstall when just our own code changed.
