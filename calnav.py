@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """CalNav Browser — Modern spirit, classic roots."""
 
-__version__ = "1.1.48-alpha"
+__version__ = "1.1.49-alpha"
 
 # Bumped ONLY when the frozen build's runtime dependencies change (PyQt6 /
 # PyQt6-WebEngine version, or the vendor/ payloads — WebView2Loader.dll,
@@ -69,6 +69,7 @@ from PyQt6.QtQuick import QQuickWindow, QSGRendererInterface
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWebEngineCore import (
     QWebEngineProfile, QWebEngineSettings, QWebEngineScript, QWebEnginePage,
+    QWebEngineUrlRequestInterceptor, qWebEngineChromiumVersion,
 )
 from PyQt6.QtWebChannel import QWebChannel
 from PyQt6.QtCore import (
@@ -320,6 +321,73 @@ CHROME_COMPAT_JS = """
     }
 })();
 """
+
+# ── Client Hints ("Google Chrome" brand) ──────────────────────────────────────
+# QtWebEngine announces itself via Client Hints (Sec-CH-UA header and
+# navigator.userAgentData) as just "Chromium" — real Chrome also lists the
+# "Google Chrome" brand. Google's sign-in uses this to refuse "browsers or
+# apps that may not be secure". The UA string is already Chrome-like, so
+# these two are the remaining giveaways; align both with real Chrome.
+def _chrome_brands_header() -> str:
+    major = qWebEngineChromiumVersion().split(".")[0]
+    return (f'"Chromium";v="{major}", "Google Chrome";v="{major}", '
+            f'"Not=A?Brand";v="24"')
+
+
+class ChromeHintsInterceptor(QWebEngineUrlRequestInterceptor):
+    """Rewrites Sec-CH-UA on every request so the brand list matches Chrome."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._value = _chrome_brands_header().encode()
+
+    def interceptRequest(self, info):
+        try:
+            info.setHttpHeader(b"sec-ch-ua", self._value)
+        except Exception:
+            pass
+
+
+def _uadata_js() -> str:
+    major = qWebEngineChromiumVersion().split(".")[0]
+    full = qWebEngineChromiumVersion()
+    return """
+(function () {
+    'use strict';
+    try {
+        var real = navigator.userAgentData;
+        if (!real || real.__calnav) return;
+        var brands = [
+            { brand: 'Chromium', version: '%(major)s' },
+            { brand: 'Google Chrome', version: '%(major)s' },
+            { brand: 'Not=A?Brand', version: '24' }
+        ];
+        var full = [
+            { brand: 'Chromium', version: '%(full)s' },
+            { brand: 'Google Chrome', version: '%(full)s' },
+            { brand: 'Not=A?Brand', version: '24.0.0.0' }
+        ];
+        var fake = {
+            __calnav: true,
+            brands: brands,
+            mobile: real.mobile,
+            platform: real.platform,
+            getHighEntropyValues: function (hints) {
+                return real.getHighEntropyValues(hints).then(function (v) {
+                    if (v && v.fullVersionList) v.fullVersionList = full;
+                    if (v && v.brands) v.brands = brands;
+                    return v;
+                });
+            },
+            toJSON: function () { return { brands: brands, mobile: real.mobile, platform: real.platform }; }
+        };
+        Object.defineProperty(Navigator.prototype, 'userAgentData', {
+            get: function () { return fake; }, configurable: true, enumerable: true
+        });
+    } catch (e) {}
+})();
+""" % {"major": major, "full": full}
+
 
 DETECT_FORMS_JS = """
 (function() {
@@ -5157,6 +5225,12 @@ class CalNavWindow(QMainWindow):
         p = self._web_profile
         p.setHttpUserAgent(IE_UA if self._ie_mode else self._build_chrome_ua())
         p.downloadRequested.connect(self._on_download_requested)
+        if not self._ie_mode:
+            if not hasattr(self, "_hints_interceptor"):
+                self._hints_interceptor = ChromeHintsInterceptor(self)
+            p.setUrlRequestInterceptor(self._hints_interceptor)
+        else:
+            p.setUrlRequestInterceptor(None)
 
         s = p.settings()
         s.setAttribute(QWebEngineSettings.WebAttribute.JavascriptEnabled, True)
@@ -5183,7 +5257,8 @@ class CalNavWindow(QMainWindow):
 
         scripts = p.scripts()
         for name in ("calnav_ie_shims", "calnav_qwebchannel", "calnav_forms",
-                     "calnav_media", "calnav_chrome_compat", "calnav_autofill"):
+                     "calnav_media", "calnav_chrome_compat", "calnav_autofill",
+                     "calnav_uadata"):
             for old in scripts.find(name):
                 scripts.remove(old)
 
@@ -5205,6 +5280,14 @@ class CalNavWindow(QMainWindow):
             )
             qwc_script.setWorldId(QWebEngineScript.ScriptWorldId.MainWorld)
             scripts.insert(qwc_script)
+
+        if not self._ie_mode:
+            uad_script = QWebEngineScript()
+            uad_script.setName("calnav_uadata")
+            uad_script.setSourceCode(_uadata_js())
+            uad_script.setInjectionPoint(QWebEngineScript.InjectionPoint.DocumentCreation)
+            uad_script.setWorldId(QWebEngineScript.ScriptWorldId.MainWorld)
+            scripts.insert(uad_script)
 
         form_script = QWebEngineScript()
         form_script.setName("calnav_forms")
