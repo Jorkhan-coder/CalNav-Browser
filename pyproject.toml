@@ -27,6 +27,7 @@ py-modules = [
     "calnav_bookmarks",
     "calnav_ie_host",
     "calnav_mailguard",
+    "calnav_mailnet",
     "calnav_passwords",
     "calnav_profiles",
     "calnav_session",

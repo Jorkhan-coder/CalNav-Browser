@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """CalNav Browser — Modern spirit, classic roots."""
 
-__version__ = "1.1.51-alpha"
+__version__ = "1.1.52-alpha"
 
 # Bumped ONLY when the frozen build's runtime dependencies change (PyQt6 /
 # PyQt6-WebEngine version, or the vendor/ payloads — WebView2Loader.dll,
@@ -5466,6 +5466,55 @@ class CalNavWindow(QMainWindow):
         calnav_mailguard: DOM extraction, Gmail auth headers, local rules)."""
         calnav_mailguard.run(self, self.webview)
 
+    # ── MailGuard: indicatore automatico sul pulsante 🛡 (opzionale) ─────────
+    _MG_DEFAULT_TIP = "Verifica affidabilit\u00e0 mail  Ctrl+Shift+M"
+
+    def _mailguard_schedule(self):
+        """Dopo un cambio di pagina/scheda, se l'opzione «analizza
+        automaticamente» \u00e8 attiva, rianalizza la mail aperta (con attesa,
+        perch\u00e9 Gmail carica il messaggio dopo aver cambiato indirizzo)."""
+        if not hasattr(self, "btn_mailguard"):
+            return
+        st = calnav_mailguard.store_for(self)
+        if not st or not st.get("auto"):
+            if getattr(self, "_mg_badge_on", False):
+                self._mailguard_badge(None)
+            return
+        t = getattr(self, "_mg_timer", None)
+        if t is None:
+            t = QTimer(self)
+            t.setSingleShot(True)
+            t.timeout.connect(self._mailguard_auto)
+            self._mg_timer = t
+        t.start(1500)
+
+    def _mailguard_auto(self):
+        view = self.webview
+        if view is None or not calnav_mailguard.AUTO_HOSTS_RE.search(view.url().host().lower()):
+            self._mailguard_badge(None)
+            return
+        key, now = view.url().toString(), time.time()
+        if key == getattr(self, "_mg_key", None) and now - getattr(self, "_mg_t", 0) < 20:
+            return
+        self._mg_key, self._mg_t = key, now
+        calnav_mailguard.run(
+            self, view,
+            silent_cb=lambda res, v=view: self._mailguard_badge(res if v is self.webview else None))
+
+    def _mailguard_badge(self, result):
+        if not hasattr(self, "btn_mailguard"):
+            return
+        btn = self.btn_mailguard
+        if not result:
+            btn.setText("\U0001f6e1")
+            btn.setToolTip(self._MG_DEFAULT_TIP)
+            self._mg_badge_on = False
+            return
+        score = result["score"]
+        btn.setText("\U0001f7e2" if score >= 75 else "\U0001f7e1" if score >= 45 else "\U0001f534")
+        btn.setToolTip(f"Mail: {score}/100 \u2014 {result['level']}. Clic per i dettagli  Ctrl+Shift+M")
+        self._mg_badge_on = True
+
     def _open_print_preview(self, view: Optional[QWebEngineView] = None):
         view = view or self.webview
         if view is None:
@@ -6188,6 +6237,8 @@ class CalNavWindow(QMainWindow):
         """Update toolbar state to reflect newly-selected tab."""
         if index < 0:
             return
+        self._mailguard_badge(None)
+        self._mailguard_schedule()
 
         raw_data = self._tab_bar.tabData(index)
 
@@ -7085,6 +7136,7 @@ class CalNavWindow(QMainWindow):
         is_current = (view is self.webview)
 
         if is_current:
+            self._mailguard_schedule()
             u = url.toString()
             if u != "about:blank":
                 self.address_bar.setText(u)
@@ -7137,6 +7189,7 @@ class CalNavWindow(QMainWindow):
             pass   # title will be updated via titleChanged
         if view is not self.webview:
             return
+        self._mailguard_schedule()
         self.progress_bar.setValue(100)
         self.progress_bar.hide()
         self.btn_reload.setText("\u21bb")

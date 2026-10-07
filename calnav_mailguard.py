@@ -17,6 +17,8 @@ import re
 from typing import Dict, List, Optional
 from urllib.parse import urlparse, parse_qs, unquote
 
+from calnav_mailnet import MailGuardStore, enrich
+
 # ── Estrazione dal DOM (Gmail, Outlook, Yahoo, Roundcube/Libero/generico) ────
 EXTRACT_JS = r"""
 (function () {
@@ -387,14 +389,66 @@ def _brand_hit(domain: str) -> Optional[str]:
 
 # ── Motore di regole ─────────────────────────────────────────────────────────
 class Finding:
-    __slots__ = ("points", "title", "detail")
+    """soft=True: segnale di tono/stile, che uno scarto per mittente fidato e
+    verificato può ignorare (urgenza, richieste di dati, link accorciati…)."""
+    __slots__ = ("points", "title", "detail", "soft")
 
-    def __init__(self, points: int, title: str, detail: str = ""):
-        self.points, self.title, self.detail = points, title, detail
+    def __init__(self, points: int, title: str, detail: str = "", soft: bool = False):
+        self.points, self.title, self.detail, self.soft = points, title, detail, soft
 
 
-def analyze(data: dict) -> dict:
-    """data = output di EXTRACT_JS. Ritorna {score, level, findings, ...}."""
+def _age_points(days: Optional[int]) -> int:
+    if days is None:
+        return 0
+    return 30 if days < 7 else 22 if days < 30 else 10 if days < 90 else 3 if days < 365 else 0
+
+
+def _age_text(days: Optional[int]) -> str:
+    if days is None:
+        return ""
+    if days < 1:
+        return "registrato oggi"
+    if days < 60:
+        return f"registrato {days} giorni fa"
+    if days < 730:
+        return f"registrato {days // 30} mesi fa"
+    return f"registrato {days // 365} anni fa"
+
+
+def _legit_domains() -> set:
+    return {registered_domain(d) for v in BRANDS.values() for d in v} | FREE_MAIL
+
+
+def collect_targets(data: dict):
+    """(domini, url) da sottoporre ai controlli di rete opzionali."""
+    skip = _legit_domains()
+    domains, urls = [], []
+    m = _EMAIL_RE.search((data.get("from_email") or "").lower())
+    if m:
+        d = registered_domain(m.group(1))
+        if d not in skip:
+            domains.append(d)
+    for ln in data.get("links") or []:
+        href = _unwrap(ln.get("href") or "")
+        if not href.lower().startswith(("http://", "https://")):
+            continue
+        urls.append(href)
+        try:
+            host = (urlparse(href).hostname or "").lower()
+        except Exception:
+            continue
+        reg = registered_domain(host)
+        if host and reg not in skip and reg not in SHORTENERS and reg not in domains \
+                and not re.fullmatch(r"\d{1,3}(\.\d{1,3}){3}", host):
+            domains.append(reg)
+    return domains[:8], list(dict.fromkeys(urls))[:300]
+
+
+def analyze(data: dict, ctx: Optional[dict] = None) -> dict:
+    """data = output di EXTRACT_JS; ctx = esiti opzionali ({'ages', 'listed',
+    'trusted', 'rdap', 'feeds'}). Ritorna {score, level, findings, ...}."""
+    ctx = ctx or {}
+    ages = ctx.get("ages") or {}
     f: List[Finding] = []
     from_email = (data.get("from_email") or "").strip().lower()
     from_name = (data.get("from_name") or "").strip()
@@ -426,15 +480,21 @@ def analyze(data: dict) -> dict:
             f.append(Finding(25, "Dominio del mittente con caratteri speciali (punycode)",
                              "Può nascondere caratteri che somigliano a lettere latine."))
         if sender_dom.split(".")[-1] in RISKY_TLDS:
-            f.append(Finding(10, f"Estensione di dominio a rischio (.{sender_dom.split('.')[-1]})"))
+            f.append(Finding(10, f"Estensione di dominio a rischio (.{sender_dom.split('.')[-1]})", soft=True))
         if re.search(r"\d{4,}", sender_dom.split(".")[0]):
-            f.append(Finding(5, "Dominio del mittente con lunga sequenza di numeri"))
+            f.append(Finding(5, "Dominio del mittente con lunga sequenza di numeri", soft=True))
         rm = _EMAIL_RE.search(reply_to)
         if rm and registered_domain(rm.group(1)) != sender_dom:
             f.append(Finding(15, f"Reply-To diverso dal mittente ({registered_domain(rm.group(1))})",
                              "Le risposte andrebbero a un indirizzo diverso da quello che ha scritto."))
 
+    sage = ages.get(sender_dom)
+    if sender_dom and _age_points(sage):
+        f.append(Finding(_age_points(sage), f"Dominio del mittente recente: {sender_dom} ({_age_text(sage)})",
+                         "I domini usati per il phishing sono spesso registrati da pochi giorni."))
+
     # — Link —
+    listed = {u: src for u, src in ctx.get("listed") or []}
     seen = set()
     mismatch = ip = short = punyl = risky = deep = at = http = lookalike = 0
     link_rows = []
@@ -451,30 +511,33 @@ def analyze(data: dict) -> dict:
             continue
         reg = registered_domain(host)
         shown = (ln.get("text") or "").strip()
-        link_rows.append((shown, host))
         key = (shown, href)
         if key in seen:
             continue
         seen.add(key)
+        row = {"shown": shown, "href": href, "host": host, "reg": reg, "flags": [], "age": ages.get(reg)}
+        link_rows.append(row)
         sm = _URLISH_RE.match(shown)
         if sm and registered_domain(sm.group(1).lower()) != reg:
-            mismatch += 1
+            mismatch += 1; row["flags"].append("mismatch")
         if re.fullmatch(r"\d{1,3}(\.\d{1,3}){3}", host):
-            ip += 1
+            ip += 1; row["flags"].append("ip")
         if host in SHORTENERS:
-            short += 1
+            short += 1; row["flags"].append("short")
         if "xn--" in host:
-            punyl += 1
+            punyl += 1; row["flags"].append("puny")
         if reg.split(".")[-1] in RISKY_TLDS:
-            risky += 1
+            risky += 1; row["flags"].append("risky")
         if host.count(".") >= 4:
-            deep += 1
+            deep += 1; row["flags"].append("deep")
         if "@" in u.netloc:
-            at += 1
+            at += 1; row["flags"].append("at")
         if u.scheme == "http":
-            http += 1
+            http += 1; row["flags"].append("http")
         if _brand_hit(host):
-            lookalike += 1
+            lookalike += 1; row["flags"].append("lookalike")
+        if href in listed:
+            row["flags"].append("listed")
     if mismatch:
         f.append(Finding(30, f"{mismatch} link con testo diverso dalla destinazione reale",
                          "Il testo mostra un sito, ma il click porta altrove."))
@@ -487,13 +550,23 @@ def analyze(data: dict) -> dict:
     if punyl:
         f.append(Finding(15, f"{punyl} link con dominio punycode"))
     if short:
-        f.append(Finding(10, f"{short} link accorciati (destinazione non verificabile)"))
+        f.append(Finding(10, f"{short} link accorciati (destinazione non verificabile)", soft=True))
     if risky:
-        f.append(Finding(10, f"{risky} link verso estensioni di dominio a rischio"))
+        f.append(Finding(10, f"{risky} link verso estensioni di dominio a rischio", soft=True))
     if deep:
-        f.append(Finding(8, f"{deep} link con troppi sottodomini"))
+        f.append(Finding(8, f"{deep} link con troppi sottodomini", soft=True))
     if http:
-        f.append(Finding(5, f"{http} link non cifrati (http)"))
+        f.append(Finding(5, f"{http} link non cifrati (http)", soft=True))
+    n_listed = sum(1 for r in link_rows if "listed" in r["flags"])
+    if n_listed:
+        srcs = ", ".join(sorted({listed[r["href"]] for r in link_rows if "listed" in r["flags"]}))
+        f.append(Finding(min(60, 45 + 15 * (n_listed - 1)), ((((f"{n_listed} link presenti in elenchi di phishing noti" if n_listed > 1 else "Un link presente negli elenchi di phishing noti") if n_listed > 1 else "Un link presente negli elenchi di phishing noti") if n_listed > 1 else "Un link presente negli elenchi di phishing noti") if n_listed > 1 else "Un link presente negli elenchi di phishing noti"),
+                         f"Segnalati da: {srcs}. Non aprirli."))
+    young = [r for r in link_rows if _age_points(r["age"])]
+    if young:
+        worst = min(young, key=lambda r: r["age"])
+        f.append(Finding(max(_age_points(r["age"]) for r in young),
+                         ((((f"{len(young)} link verso domini recenti (il più recente: {worst['reg']}, {_age_text(worst['age'])})" if len(young) > 1 else f"Link verso un dominio recente: {worst['reg']} ({_age_text(worst['age'])})") if len(young) > 1 else f"Link verso un dominio recente: {worst['reg']} ({_age_text(worst['age'])})") if len(young) > 1 else f"Link verso un dominio recente: {worst['reg']} ({_age_text(worst['age'])})") if len(young) > 1 else f"Link verso un dominio recente: {worst['reg']} ({_age_text(worst['age'])})")))
 
     # — Allegati —
     for name in data.get("attachments") or []:
@@ -512,15 +585,15 @@ def analyze(data: dict) -> dict:
     urg = [p for p in URGENCY if re.search(p, text)]
     if urg:
         f.append(Finding(min(15, 5 * len(urg)), "Linguaggio di urgenza o minaccia",
-                         "Il phishing spinge ad agire in fretta senza riflettere."))
+                         "Il phishing spinge ad agire in fretta senza riflettere.", soft=True))
     cred = [p for p in CREDENTIALS if re.search(p, text)]
     if cred:
         f.append(Finding(min(15, 7 * len(cred)), "Richiesta di credenziali, dati personali o pagamento",
-                         "Gli enti seri non chiedono questi dati via mail."))
+                         "Gli enti seri non chiedono questi dati via mail.", soft=True))
     if any(re.search(p, text) for p in GENERIC_GREETING):
-        f.append(Finding(5, "Saluto generico (nessun nome personale)"))
+        f.append(Finding(5, "Saluto generico (nessun nome personale)", soft=True))
     if sender_dom in FREE_MAIL and (urg or cred) and not any(x.points >= 35 for x in f):
-        f.append(Finding(8, "Richiesta sensibile da un indirizzo di posta gratuita"))
+        f.append(Finding(8, "Richiesta sensibile da un indirizzo di posta gratuita", soft=True))
 
     # — Autenticazione (solo se gli header sono stati letti: Gmail) —
     if auth:
@@ -547,7 +620,24 @@ def analyze(data: dict) -> dict:
         f.append(Finding(0, "Autenticazione SPF/DKIM/DMARC non verificata",
                          "Disponibile solo per Gmail; qui il giudizio si basa su contenuto, link e dominio."))
 
-    risk = max(0, min(100, sum(x.points for x in f if x.points > 0)))
+    # — Mittente fidato: sconto SOLO se l'invio è verificato (altrimenti
+    #   l'indirizzo potrebbe essere falsificato) —
+    trusted_state = None
+    if ctx.get("trusted"):
+        verified = bool(auth) and auth.get("dmarc") != "fail" and auth.get("spf") not in ("fail", "softfail") \
+            and (auth.get("dmarc") == "pass" or (auth.get("spf") == "pass" and auth.get("dkim") == "pass"))
+        if verified:
+            trusted_state = "effective"
+            f.append(Finding(-1, "Mittente fidato e verificato",
+                             "Ignorati i segnali di tono e stile (urgenza, richieste di dati, link accorciati…). "
+                             "Restano attivi spoofing, domini simili, allegati, domini recenti ed elenchi di phishing."))
+        else:
+            trusted_state = "unverified"
+            f.append(Finding(0, "Mittente nella lista dei fidati, ma non verificabile",
+                             "Nessuno sconto: senza SPF/DKIM validi l'indirizzo potrebbe essere falsificato."))
+    ignored = trusted_state == "effective"
+
+    risk = max(0, min(100, sum(x.points for x in f if x.points > 0 and not (ignored and x.soft))))
     score = 100 - risk
     if score >= 75:
         level = "Affidabile"
@@ -558,38 +648,82 @@ def analyze(data: dict) -> dict:
     f.sort(key=lambda x: (x.points <= 0, -x.points))
     return {
         "score": score, "level": level,
-        "findings": [(x.points, x.title, x.detail) for x in f],
+        "findings": [(x.points, x.title, x.detail, bool(ignored and x.soft)) for x in f],
         "sender": f"{from_name} <{from_email}>" if from_name else from_email,
+        "from_email": from_email, "trusted_state": trusted_state,
         "subject": subject, "links": link_rows, "provider": data.get("provider", ""),
         "approx": bool(data.get("approx")), "auth": auth,
+        "rdap": bool(ctx.get("rdap")), "feeds": bool(ctx.get("feeds")),
     }
 
 
 # ── Finestra del risultato ───────────────────────────────────────────────────
-def show_report(parent, data: dict):
-    """Mostra il risultato. `data` None/vuoto → messaggio 'nessuna mail aperta'."""
+_FLAG_LABEL = {
+    "mismatch": "il testo mostra un altro sito", "ip": "indirizzo IP", "short": "link accorciato",
+    "puny": "punycode", "risky": "dominio a rischio", "deep": "troppi sottodomini", "at": "contiene @",
+    "http": "non cifrato", "lookalike": "imita un marchio", "listed": "in elenco di phishing",
+}
+_HARD_FLAGS = {"mismatch", "ip", "at", "puny", "lookalike", "listed"}
+
+
+def store_for(parent) -> Optional[MailGuardStore]:
+    """Impostazioni di MailGuard del profilo corrente (None se non disponibili)."""
+    try:
+        path = parent.profile_manager.current.path / "mailguard.json"
+    except Exception:
+        return None
+    st = getattr(parent, "_mg_store", None)
+    if st is None or st.path != path:
+        st = MailGuardStore(path)
+        parent._mg_store = st
+    return st
+
+
+def show_report(parent, data: dict, ctx: Optional[dict] = None, store: Optional[MailGuardStore] = None) -> str:
+    """Mostra il risultato. Ritorna 'close' oppure 'rerun' (opzioni cambiate)."""
+    if not data or not (data.get("body") or data.get("from_email")):
+        _report_message(parent, "Nessuna mail aperta rilevata in questa pagina.\n\n"
+                                "Apri un messaggio in Gmail, Outlook o nella tua webmail e riprova.")
+        return "close"
+    ctx = dict(ctx or {})
+    while True:
+        if store:
+            ctx["trusted"] = store.is_trusted(data.get("from_email"))
+        r = analyze(data, ctx)
+        action = _report_once(parent, r, data, store)
+        if action != "refresh":
+            return action
+
+
+def _report_message(parent, text: str):
+    from PyQt6.QtWidgets import QDialog, QVBoxLayout, QLabel
+    dlg = QDialog(parent)
+    dlg.setWindowTitle("Affidabilità mail — CalNav")
+    dlg.setMinimumSize(420, 160)
+    dlg.setStyleSheet("QDialog{background:#0F1E33;} QLabel{color:#E6F1FF;}")
+    lay = QVBoxLayout(dlg)
+    lbl = QLabel(text)
+    lbl.setWordWrap(True)
+    lay.addWidget(lbl)
+    dlg.exec()
+
+
+def _report_once(parent, r: dict, data: dict, store: Optional[MailGuardStore]) -> str:
     from PyQt6.QtCore import Qt
     from PyQt6.QtWidgets import (
-        QDialog, QVBoxLayout, QLabel, QProgressBar, QScrollArea, QWidget, QPushButton, QHBoxLayout,
+        QDialog, QVBoxLayout, QLabel, QProgressBar, QScrollArea, QWidget, QPushButton, QHBoxLayout, QCheckBox,
+        QFrame,
     )
     from PyQt6.QtGui import QFont
 
     dlg = QDialog(parent)
     dlg.setWindowTitle("Affidabilità mail — CalNav")
-    dlg.setMinimumSize(520, 460)
-    dlg.setStyleSheet("QDialog{background:#0F1E33;} QLabel{color:#E6F1FF;}")
+    dlg.setMinimumSize(620, 760)
+    dlg.setStyleSheet("QDialog{background:#0F1E33;} QLabel{color:#E6F1FF;} "
+                      "QCheckBox{color:#C9D8EA;font-size:11px;}")
     lay = QVBoxLayout(dlg)
     lay.setContentsMargins(20, 18, 20, 16)
 
-    if not data or not (data.get("body") or data.get("from_email")):
-        lbl = QLabel("Nessuna mail aperta rilevata in questa pagina.\n\n"
-                     "Apri un messaggio in Gmail, Outlook o nella tua webmail e riprova.")
-        lbl.setWordWrap(True)
-        lay.addWidget(lbl)
-        dlg.exec()
-        return
-
-    r = analyze(data)
     color = "#2ECC71" if r["score"] >= 75 else "#F5A623" if r["score"] >= 45 else "#E74C3C"
     head = QLabel(f"{r['score']}/100 — {r['level']}")
     head.setFont(QFont("Segoe UI", 20, QFont.Weight.Bold))
@@ -620,28 +754,116 @@ def show_report(parent, data: dict):
     inner = QWidget()
     il = QVBoxLayout(inner)
     il.setContentsMargins(0, 0, 0, 0)
+
+    def section(title):
+        t = QLabel(f"<b>{title}</b>")
+        t.setTextFormat(Qt.TextFormat.RichText)
+        t.setStyleSheet("color:#00D4FF;margin-top:8px;")
+        il.addWidget(t)
+
+    section("Esito dell'analisi")
     if r["findings"]:
-        for pts, title, detail in r["findings"]:
-            c = ("#2ECC71" if pts < 0 else "#E74C3C" if pts >= 25
+        for pts, title, detail, ignored in r["findings"]:
+            c = ("#6F89A8" if ignored else "#2ECC71" if pts < 0 else "#E74C3C" if pts >= 25
                  else "#F5A623" if pts >= 10 else "#9DB4D0")
-            row = QLabel(f"<span style='color:{c}'>●</span> <b>{_esc(title)}</b>"
+            prefix = "(ignorato) " if ignored else ""
+            style = "text-decoration:line-through;" if ignored else ""
+            row = QLabel(f"<span style='color:{c}'>●</span> <span style='{style}'><b>{prefix}{_esc(title)}</b></span>"
                          + (f"<br><span style='color:#9DB4D0'>{_esc(detail)}</span>" if detail else ""))
             row.setWordWrap(True)
             row.setTextFormat(Qt.TextFormat.RichText)
             il.addWidget(row)
     else:
         il.addWidget(QLabel("Nessun segnale sospetto rilevato dalle regole locali."))
+
+    if r["links"]:
+        section(f"Link nel messaggio ({len(r['links'])}) — cosa si legge → dove porta davvero")
+        for row in r["links"][:25]:
+            hard = any(fl in _HARD_FLAGS for fl in row["flags"])
+            c = "#E74C3C" if hard else "#F5A623" if row["flags"] else "#9DB4D0"
+            shown = (row["shown"] or "(immagine o pulsante)")[:70]
+            tags = [_FLAG_LABEL[fl] for fl in row["flags"] if fl in _FLAG_LABEL]
+            if row.get("age") is not None:
+                tags.append(_age_text(row["age"]))
+            tag_html = (f"<br><span style='color:{c};font-size:11px'>⚠ {_esc(' · '.join(tags))}</span>"
+                        if tags else "")
+            lbl = QLabel(f"<span style='color:{c}'>{'⚠' if row['flags'] else '•'}</span> "
+                         f"{_esc(shown)} <span style='color:#6F89A8'>→</span> "
+                         f"<span style='font-family:Consolas,monospace'>{_esc(row['host'])}</span>{tag_html}")
+            lbl.setWordWrap(True)
+            lbl.setTextFormat(Qt.TextFormat.RichText)
+            lbl.setToolTip(row["href"][:300])
+            il.addWidget(lbl)
+        if len(r["links"]) > 25:
+            il.addWidget(QLabel(f"… e altri {len(r['links']) - 25} link"))
     il.addStretch(1)
     scroll = QScrollArea()
     scroll.setWidgetResizable(True)
+    scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
     scroll.setStyleSheet("QScrollArea{border:none;background:transparent;}"
                          "QScrollArea>QWidget>QWidget{background:transparent;}")
     scroll.setWidget(inner)
     lay.addWidget(scroll, 1)
 
-    note = QLabel("Stima euristica eseguita sul tuo computer: nulla viene inviato online. "
-                  "Non verifica SPF/DKIM/DMARC né la reputazione dei link, e non è una garanzia. "
-                  "Nel dubbio non cliccare: apri il sito digitando tu l'indirizzo.")
+    btn_style = ("QPushButton{background:#1C3050;color:#00D4FF;border:none;border-radius:6px;"
+                 "padding:6px 14px;font-weight:bold;}QPushButton:hover{background:#25406A;}")
+    ghost_style = ("QPushButton{background:transparent;color:#6F89A8;border:none;padding:6px 8px;}"
+                   "QPushButton:hover{color:#00D4FF;}")
+
+    # — mittente fidato —
+    if store and r.get("from_email"):
+        is_tr = store.is_trusted(r["from_email"])
+        tb = QPushButton("☆ Rimuovi dai mittenti fidati" if is_tr else "★ Fidati di questo mittente")
+        tb.setToolTip("Con un mittente fidato e verificato (SPF/DKIM/DMARC superati) ignoro i segnali di "
+                      "tono e stile. Senza verifica l'indirizzo potrebbe essere falsificato e non c'è sconto.")
+        tb.setStyleSheet(btn_style)
+        tb.clicked.connect(lambda: (store.untrust(r["from_email"]) if is_tr else store.trust(r["from_email"]),
+                                    dlg.done(2)))
+        lay.addWidget(tb)
+
+    # — controlli opzionali —
+    if store:
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setStyleSheet("color:#1C3050;")
+        lay.addWidget(sep)
+        changed = {"v": False}
+        rerun = QPushButton("Riesegui analisi")
+        rerun.setStyleSheet(btn_style)
+        rerun.setVisible(False)
+        rerun.clicked.connect(lambda: dlg.done(3))
+
+        def opt(key, text, tip):
+            row = QHBoxLayout()
+            cb = QCheckBox()
+            cb.setToolTip(tip)
+            cb.setChecked(bool(store.get(key)))
+            lbl = QLabel(text)
+            lbl.setWordWrap(True)
+            lbl.setToolTip(tip)
+            lbl.setStyleSheet("color:#C9D8EA;font-size:11px;")
+            lbl.mousePressEvent = lambda e: cb.toggle()
+
+            def toggled(v):
+                store.set(key, bool(v))
+                if key != "auto":
+                    changed["v"] = True
+                    rerun.setVisible(True)
+            cb.toggled.connect(toggled)
+            row.addWidget(cb, 0, Qt.AlignmentFlag.AlignTop)
+            row.addWidget(lbl, 1)
+            lay.addLayout(row)
+
+        opt("rdap", "Controlla l'età dei domini (invia solo i nomi di dominio a rdap.org)",
+            "Un dominio registrato da pochi giorni è un forte indizio di phishing.")
+        opt("feeds", "Confronta i link con elenchi di phishing noti (scarica l'elenco: nessun link viene inviato)",
+            "OpenPhish e Phishing.Database, aggiornati periodicamente. Il confronto avviene sul tuo computer.")
+        opt("auto", "Analizza automaticamente le mail che apro (indicatore sul pulsante 🛡)",
+            "Verde/giallo/rosso sul pulsante appena apri un messaggio in Gmail, Outlook o Yahoo.")
+        lay.addWidget(rerun)
+
+    note = QLabel("Stima euristica eseguita sul tuo computer. Non è una garanzia: "
+                  "nel dubbio non cliccare e apri il sito digitando tu l'indirizzo.")
     note.setWordWrap(True)
     note.setStyleSheet("color:#6F89A8;font-size:11px;")
     lay.addWidget(note)
@@ -650,17 +872,16 @@ def show_report(parent, data: dict):
     diag.setToolTip("Copia negli appunti la struttura anonima della pagina (nessun testo della mail), "
                     "utile per migliorare il supporto a questa webmail.")
     diag.clicked.connect(lambda: _copy_diag(data, diag))
-    diag.setStyleSheet("QPushButton{background:transparent;color:#6F89A8;border:none;padding:6px 8px;}"
-                       "QPushButton:hover{color:#00D4FF;}")
+    diag.setStyleSheet(ghost_style)
     btns.addWidget(diag)
     btns.addStretch(1)
     ok = QPushButton("Chiudi")
     ok.clicked.connect(dlg.accept)
-    ok.setStyleSheet("QPushButton{background:#1C3050;color:#00D4FF;border:none;border-radius:6px;"
-                     "padding:6px 18px;font-weight:bold;}QPushButton:hover{background:#25406A;}")
+    ok.setStyleSheet(btn_style)
     btns.addWidget(ok)
     lay.addLayout(btns)
-    dlg.exec()
+    code = dlg.exec()
+    return {2: "refresh", 3: "rerun"}.get(code, "close")
 
 
 def _copy_diag(data: dict, btn):
@@ -679,32 +900,48 @@ def _copy_diag(data: dict, btn):
     btn.setText("Copiata ✓")
 
 
-# ── Orchestrazione (estrazione → header Gmail → report) ──────────────────────
-def run(parent, view):
-    """Punto d'ingresso dalla toolbar. `view` = QWebEngineView della scheda."""
+# ── Orchestrazione (estrazione → header Gmail → controlli di rete → report) ──
+AUTO_HOSTS_RE = re.compile(r"(^|\.)(mail\.google\.com|outlook\.(live|office|office365)\.com|outlook\.com|mail\.yahoo\.com)$")
+
+
+def run(parent, view, silent_cb=None):
+    """Punto d'ingresso dalla toolbar (o dall'indicatore automatico).
+    `view` = QWebEngineView della scheda. Con `silent_cb` non mostra la finestra:
+    chiama silent_cb(risultato di analyze() oppure None)."""
     if view is None:
-        show_report(parent, None)
+        if silent_cb:
+            silent_cb(None)
+        else:
+            show_report(parent, None)
         return
-    runner = _Runner(parent, view)
+    runner = _Runner(parent, view, silent_cb)
     parent._mailguard_runner = runner      # tiene vivo il runner durante il polling
     runner.start()
 
 
 class _Runner:
     POLL_MS, MAX_TRIES = 400, 20
+    NET_POLL_MS, NET_MAX_TRIES = 250, 48      # ~12 s per i controlli di rete
 
-    def __init__(self, parent, view):
+    def __init__(self, parent, view, silent_cb=None):
         from PyQt6.QtCore import QTimer
         self.parent, self.view, self.data, self.tries = parent, view, None, 0
+        self.silent_cb = silent_cb
+        self.store = store_for(parent)
         self.timer = QTimer(parent)
         self.timer.setInterval(self.POLL_MS)
         self.timer.timeout.connect(self._poll)
+        self.ntimer = QTimer(parent)
+        self.ntimer.setInterval(self.NET_POLL_MS)
+        self.ntimer.timeout.connect(self._net_poll)
+        self._net = {"done": False, "res": None}
+        self._ntries = 0
 
     def start(self):
         try:
             self.view.page().runJavaScript(EXTRACT_JS, self._on_extract)
         except RuntimeError:
-            self._finish(None)
+            self._deliver(None, {})
 
     def _on_extract(self, result):
         try:
@@ -719,17 +956,17 @@ class _Runner:
                 return
             except RuntimeError:
                 pass
-        self._finish(self.data)
+        self._after_headers()
 
     def _poll(self):
         self.tries += 1
         if self.tries > self.MAX_TRIES:
             self._set_status("timeout")
-            return self._finish(self.data)
+            return self._after_headers()
         try:
             self.view.page().runJavaScript("JSON.stringify(window.__calnavMG || null)", self._on_poll)
         except RuntimeError:
-            self._finish(self.data)
+            self._after_headers()
 
     def _on_poll(self, result):
         if not self.timer.isActive():
@@ -746,16 +983,57 @@ class _Runner:
             self._set_status("ok" if auth else "no-auth-results")
         else:
             self._set_status("error:" + str(st.get("why")))
-        self._finish(self.data)
+        self._after_headers()
 
     def _set_status(self, s):
         if self.data is not None:
             self.data["headers_status"] = s
 
-    def _finish(self, data):
+    # — controlli di rete opzionali (in un thread: non blocca l'interfaccia) —
+    def _after_headers(self):
+        self.timer.stop()
+        d, st = self.data, self.store
+        if d and d.get("body") and st and (st.get("rdap") or st.get("feeds")):
+            import threading
+            domains, urls = collect_targets(d)
+            use_rdap, use_feeds = bool(st.get("rdap")), bool(st.get("feeds"))
+
+            def work():
+                try:
+                    self._net["res"] = enrich(st, domains, urls, use_rdap, use_feeds)
+                except Exception:
+                    self._net["res"] = None
+                self._net["done"] = True
+            threading.Thread(target=work, daemon=True).start()
+            self.ntimer.start()
+            return
+        self._deliver(d, {})
+
+    def _net_poll(self):
+        self._ntries += 1
+        if self._net["done"] or self._ntries > self.NET_MAX_TRIES:
+            self.ntimer.stop()
+            self._deliver(self.data, self._net["res"] or {})
+
+    def _deliver(self, data, ctx):
         from PyQt6.QtCore import QTimer
         self.timer.stop()
-        QTimer.singleShot(0, lambda: show_report(self.parent, data))   # fuori dalla callback JS
+        self.ntimer.stop()
+        ctx = dict(ctx or {})
+        if self.silent_cb:
+            res = None
+            if data and data.get("body"):
+                if self.store:
+                    ctx["trusted"] = self.store.is_trusted(data.get("from_email"))
+                res = analyze(data, ctx)
+            QTimer.singleShot(0, lambda: self.silent_cb(res))
+            return
+
+        def show():     # fuori dalla callback JS
+            action = show_report(self.parent, data, ctx, self.store)
+            if action == "rerun":
+                run(self.parent, self.view)
+        QTimer.singleShot(0, show)
 
 
 def _esc(s: str) -> str:
