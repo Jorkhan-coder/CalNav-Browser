@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """CalNav Browser — Modern spirit, classic roots."""
 
-__version__ = "1.1.49-alpha"
+__version__ = "1.1.50-alpha"
 
 # Bumped ONLY when the frozen build's runtime dependencies change (PyQt6 /
 # PyQt6-WebEngine version, or the vendor/ payloads — WebView2Loader.dll,
@@ -69,7 +69,7 @@ from PyQt6.QtQuick import QQuickWindow, QSGRendererInterface
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWebEngineCore import (
     QWebEngineProfile, QWebEngineSettings, QWebEngineScript, QWebEnginePage,
-    QWebEngineUrlRequestInterceptor, qWebEngineChromiumVersion,
+    QWebEngineUrlRequestInterceptor, qWebEngineChromiumVersion, qWebEngineVersion,
 )
 from PyQt6.QtWebChannel import QWebChannel
 from PyQt6.QtCore import (
@@ -334,18 +334,65 @@ def _chrome_brands_header() -> str:
             f'"Not=A?Brand";v="24"')
 
 
+# Google's sign-in refuses a QtWebEngine that *pretends* to be Chrome: measured
+# with a test harness against accounts.google.com, plain QtWebEngine (native
+# UA, no tweaks) is accepted, while the same engine with the QtWebEngine token
+# stripped from the UA is rejected ("Couldn't sign you in — this browser or
+# app may not be secure"), whatever else is layered on top. So on Google hosts
+# we present the engine as it really is; the Chrome disguise stays for the
+# streaming sites that need it (Twitch, Netflix…).
+_GOOGLE_HOST_RE = re.compile(
+    r"(^|\.)(google\.[a-z.]{2,6}|gstatic\.com|googleusercontent\.com|gmail\.com"
+    r"|youtube\.com|googleapis\.com)$")
+_GOOGLE_HOST_JS = ("/(^|\\.)(google\\.[a-z.]{2,6}|gstatic\\.com|googleusercontent\\.com|gmail\\.com"
+                   "|youtube\\.com|googleapis\\.com)$/.test(location.hostname)")
+
+
+def _native_ua() -> str:
+    """The UA QtWebEngine itself would send (built explicitly, so a
+    --user-agent flag or a profile override can't leak into it)."""
+    try:
+        we = qWebEngineVersion()
+    except Exception:
+        we = QT_VERSION_STR
+    return ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            f"(KHTML, like Gecko) QtWebEngine/{we} "
+            f"Chrome/{qWebEngineChromiumVersion().split('.')[0]}.0.0.0 Safari/537.36")
+
+
 class ChromeHintsInterceptor(QWebEngineUrlRequestInterceptor):
-    """Rewrites Sec-CH-UA on every request so the brand list matches Chrome."""
+    """Per request: Chrome-like Sec-CH-UA everywhere, except on Google hosts,
+    which get the engine's real (native) User-Agent and untouched hints."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._value = _chrome_brands_header().encode()
+        self._native_ua = _native_ua().encode()
 
     def interceptRequest(self, info):
         try:
-            info.setHttpHeader(b"sec-ch-ua", self._value)
+            if _GOOGLE_HOST_RE.search(info.requestUrl().host().lower()):
+                info.setHttpHeader(b"user-agent", self._native_ua)
+            else:
+                info.setHttpHeader(b"sec-ch-ua", self._value)
         except Exception:
             pass
+
+
+def _native_ua_js() -> str:
+    """On Google hosts navigator.userAgent must match the header above (the
+    profile-level UA is the Chrome disguise)."""
+    return """
+(function () {
+    'use strict';
+    if (!%(host)s) return;
+    try {
+        var ua = %(ua)s;
+        Object.defineProperty(Navigator.prototype, 'userAgent', { get: function () { return ua; }, configurable: true });
+        Object.defineProperty(Navigator.prototype, 'appVersion', { get: function () { return ua.replace(/^Mozilla\\//, ''); }, configurable: true });
+    } catch (e) {}
+})();
+""" % {"host": _GOOGLE_HOST_JS, "ua": json.dumps(_native_ua())}
 
 
 def _uadata_js() -> str:
@@ -354,6 +401,7 @@ def _uadata_js() -> str:
     return """
 (function () {
     'use strict';
+    if (%(host)s) return;
     try {
         var real = navigator.userAgentData;
         if (!real || real.__calnav) return;
@@ -386,7 +434,7 @@ def _uadata_js() -> str:
         });
     } catch (e) {}
 })();
-""" % {"major": major, "full": full}
+""" % {"major": major, "full": full, "host": _GOOGLE_HOST_JS}
 
 
 DETECT_FORMS_JS = """
@@ -5258,7 +5306,7 @@ class CalNavWindow(QMainWindow):
         scripts = p.scripts()
         for name in ("calnav_ie_shims", "calnav_qwebchannel", "calnav_forms",
                      "calnav_media", "calnav_chrome_compat", "calnav_autofill",
-                     "calnav_uadata"):
+                     "calnav_uadata", "calnav_nativeua"):
             for old in scripts.find(name):
                 scripts.remove(old)
 
@@ -5282,6 +5330,13 @@ class CalNavWindow(QMainWindow):
             scripts.insert(qwc_script)
 
         if not self._ie_mode:
+            nua_script = QWebEngineScript()
+            nua_script.setName("calnav_nativeua")
+            nua_script.setSourceCode(_native_ua_js())
+            nua_script.setInjectionPoint(QWebEngineScript.InjectionPoint.DocumentCreation)
+            nua_script.setWorldId(QWebEngineScript.ScriptWorldId.MainWorld)
+            scripts.insert(nua_script)
+
             uad_script = QWebEngineScript()
             uad_script.setName("calnav_uadata")
             uad_script.setSourceCode(_uadata_js())
@@ -7228,22 +7283,12 @@ def main():
     # ── Chromium flags (must be set BEFORE QApplication is created) ──────────
     _existing = os.environ.get("QTWEBENGINE_CHROMIUM_FLAGS", "")
 
-    # The UA we want every page to see in navigator.userAgent.
-    # QWebEngineProfile.setHttpUserAgent() updates the HTTP header but in some
-    # Qt versions it does NOT update navigator.userAgent in JavaScript.
-    # Streaming sites (Twitch, Netflix…) read navigator.userAgent via JS, so
-    # they would still see the QtWebEngine UA and refuse to play.
-    # --user-agent set at engine startup guarantees BOTH the HTTP header AND
-    # navigator.userAgent report the same Chrome-compatible string.
-    _chrome_ua = (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    )
+    # NB: no engine-level --user-agent here any more. It hard-coded
+    # Chrome/124 while the bundled Chromium is newer, and the profile-level UA
+    # (set in _apply_profile_settings) already drives both the header and
+    # navigator.userAgent on this Qt version.
 
     _flags = (
-        # Engine-level UA override — ensures navigator.userAgent matches in JS
-        f'--user-agent="{_chrome_ua}" '
         # Allow media to autoplay without a user-gesture requirement
         "--autoplay-policy=no-user-gesture-required "
         # Force software H.264/AAC decode via bundled FFmpeg.
