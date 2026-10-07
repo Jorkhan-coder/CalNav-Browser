@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """CalNav Browser — Modern spirit, classic roots."""
 
-__version__ = "1.1.50-alpha"
+__version__ = "1.1.51-alpha"
 
 # Bumped ONLY when the frozen build's runtime dependencies change (PyQt6 /
 # PyQt6-WebEngine version, or the vendor/ payloads — WebView2Loader.dll,
@@ -6797,6 +6797,12 @@ class CalNavWindow(QMainWindow):
         self.btn_keys.setFont(QFont("Segoe UI", 14))
         self.btn_keys.clicked.connect(self._open_password_vault)
         h.addWidget(self.btn_keys)
+
+        # Mail guard: phishing-reliability estimate of the open webmail message
+        self.btn_mailguard = NavButton("\U0001f6e1", "Verifica affidabilità mail  Ctrl+Shift+M")
+        self.btn_mailguard.setFont(QFont("Segoe UI", 14))
+        self.btn_mailguard.clicked.connect(self._check_mail_reliability)
+        h.addWidget(self.btn_mailguard)
 
         # "More" button \u2014 dropdown with the less-frequently-used settings
         # (stampa, tema, impostazioni) instead of one icon each on the toolbar.
